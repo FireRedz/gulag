@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
+
+from typing import Set, Tuple, Union, Optional
 from collections import Sequence
 
-from typing import Tuple, Union, Optional, Set
 from objects.player import Player
 from objects.channel import Channel
 from objects.match import Match
+from constants.privileges import Privileges
 from objects import glob
-from console import printlog
+from console import plog
 
 __all__ = (
     'Slice',
@@ -49,15 +51,15 @@ class ChannelList(Sequence):
             if c._name == name:
                 return c
 
-    def add(self, c: Channel) -> None: # bool ret success?
+    async def add(self, c: Channel) -> None:
         if c in self.channels:
-            printlog(f'{c} already in channels list!')
-            return
-        printlog(f'Adding {c} to channels list.')
-        self.channels.append(c)
+            await plog(f'{c} already in channels list!')
+        else:
+            await plog(f'Adding {c} to channels list.')
+            self.channels.append(c)
 
-    def remove(self, c: Channel) -> None:
-        printlog(f'Removing {c} from channels list.')
+    async def remove(self, c: Channel) -> None:
+        await plog(f'Removing {c} from channels list.')
         self.channels.remove(c)
 
 class MatchList(Sequence):
@@ -86,32 +88,30 @@ class MatchList(Sequence):
     def get_free(self) -> Optional[Match]:
         # Return first free match.
         for idx, m in enumerate(self.matches):
-            if not m: return idx
+            if not m:
+                return idx
 
-    def get_by_id(self, id: int) -> Optional[Match]:
+    def get_by_id(self, mid: int) -> Optional[Match]:
         for m in self.matches:
-            if not m or id != m.id:
-                continue
+            if m and m.id == mid:
+                return m
 
-            return m
-
-    def add(self, m: Match) -> bool:
+    async def add(self, m: Match) -> None:
         if m in self.matches:
-            printlog(f'{m} already in matches list!')
-            return False
+            await plog(f'{m} already in matches list!')
+            return
 
-        if (free := self.get_free()) is None:
-            printlog(f'Match list is full! Could not add {m}.')
-            return False
+        if (free := self.get_free()) is not None:
+            m.id = free
+            await plog(f'Adding {m} to matches list.')
+            self.matches[free] = m
+        else:
+            await plog(f'Match list is full! Could not add {m}.')
 
-        m.id = free
-        printlog(f'Adding {m} to matches list.')
-        self.matches[free] = m
-
-    def remove(self, m: Match) -> None:
-        printlog(f'Removing {m} from matches list.')
-        for idx, _m in enumerate(self.matches):
-            if m == _m:
+    async def remove(self, m: Match) -> None:
+        await plog(f'Removing {m} from matches list.')
+        for idx, i in enumerate(self.matches):
+            if m == i:
                 self.matches[idx] = None
                 break
 
@@ -146,59 +146,95 @@ class PlayerList(Sequence):
     def ids(self) -> Tuple[int, ...]:
         return (p.id for p in self.players)
 
+    @property
+    def staff(self) -> Set[Player]:
+        return {p for p in self.players if p.priv & Privileges.Staff}
+
     def enqueue(self, data: bytes, immune: Tuple[Player, ...] = ()) -> None:
         for p in self.players:
             if p not in immune:
                 p.enqueue(data)
 
     def get(self, token: str) -> Player:
-        for p in self.players: # might copy
+        for p in self.players:
             if p.token == token:
                 return p
 
-    def get_by_name(self, name: str) -> Player:
-        for p in self.players: # might copy
+    async def get_by_name(self, name: str, sql: bool = False) -> Player:
+        for p in self.players:
             if p.name == name:
                 return p
 
-    def get_by_id(self, id: int) -> Player:
-        for p in self.players: # might copy
-            if p.id == id:
+        if not sql:
+            # Don't fetch from SQL
+            # if not specified.
+            return
+
+        # Try to get from SQL.
+        res = await glob.db.fetch(
+            'SELECT id, priv, silence_end '
+            'FROM users WHERE name = %s',
+            [name]
+        )
+
+        return Player(**res, name=name) if res else None
+
+    async def get_by_id(self, pid: int, sql: bool = False) -> Player:
+        for p in self.players:
+            if p.id == pid:
                 return p
 
-    def get_from_cred(self, name: str, pw_md5: str) -> None:
+        if not sql:
+            # Don't fetch from SQL
+            # if not specified.
+            return
+
+        # Try to get from SQL.
+        res = await glob.db.fetch(
+            'SELECT name, priv, silence_end '
+            'FROM users WHERE id = %s',
+            [pid]
+        )
+
+        return Player(**res, id = pid) if res else None
+
+    async def get_login(self, name: str, phash: str) -> Optional[Player]:
         # Only used cached results - the user should have
         # logged into bancho at least once. (This does not
         # mean they're logged in now).
 
         # Let them pass as a string for ease of access
-        pw_md5: bytes = pw_md5.encode()
+        phash = phash.encode()
 
-        if pw_md5 not in glob.cache['bcrypt']:
+        bcrypt_cache = glob.cache['bcrypt']
+
+        if phash not in bcrypt_cache:
             # User has not logged in through bancho.
             return
 
-        res = glob.db.fetch(
+        res = await glob.db.fetch(
             'SELECT pw_hash FROM users WHERE name_safe = %s',
-            [Player.ensure_safe(name)])
+            [Player.ensure_safe(name)]
+        )
 
         if not res:
             # Could not find user in the DB.
             return
 
-        if glob.cache['bcrypt'][pw_md5] != res['pw_hash']:
+        if bcrypt_cache[phash] != res['pw_hash']:
             # Password bcrypts do not match.
             return
 
-        return self.get_by_name(name)
+        return await self.get_by_name(name)
 
-    def add(self, p: Player) -> None: # bool ret success?
+    async def add(self, p: Player) -> None:
         if p in self.players:
-            printlog(f'{p} already in players list!')
+            await plog(f'{p} already in players list!')
             return
-        printlog(f'Adding {p} to players list.')
+
+        await plog(f'Adding {p} to players list.')
         self.players.append(p)
 
-    def remove(self, p: Player) -> None:
-        printlog(f'Removing {p} from players list.')
+    async def remove(self, p: Player) -> None:
+        await plog(f'Removing {p} from players list.')
         self.players.remove(p)

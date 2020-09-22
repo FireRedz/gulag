@@ -1,6 +1,10 @@
+[![Discord](https://discordapp.com/api/guilds/748687781605408908/widget.png?style=shield)](https://discord.gg/ShEQgUx)
+
 # A dev-friendly osu! server written in modern python
 
-Looking for an easy to use, completely open-source osu! server implementation undergoing rapid development?
+Looking for a well-organized, async & completely open-source osu! server implementation undergoing rapid development?
+
+Disclaimer: this is NOT a finished project; developement is underway, but the server will not be finished for a bit to come; probably about 80% of the way.
 
 ## There are many other osu! server implementations, what makes this any different?
 
@@ -12,22 +16,36 @@ This is simply the result of my programming values and time thrown together; I'd
 
 ### Features
 
-- Fully functional multiplayer, spectator, leaderboards, score submission, and most other features of an osu! server.
+- Asynchronous server design, allowing for high efficiency along with many cool features unavailable on many other implementations.
+- Nearly full completion of multiplayer, spectator, leaderboards, score submission, osu!direct and most other features that you'd expect.
+- A strong focus on keeping an accurate cache for many things (maps [with pp values], osu! updates, many more to come..) allowing for quick responses.
 - Undergoing active development; an osu! server has always been a large goal of mine, so motivation is very high.
 - Clean and concise code, easy to make small modifications & add to the codebase; designed around this idea.
 
 ### Project focuses & goals
 
-1. Developer sanity. Many other osu! server implementations are far too complicated for the job; either in an
-   overkill sense, or sometimes through poor abstraction. With this project I aim to keep the code as simple
-   and concise as possible, while still maintaining high performance in times which matter - critical loops,
-   and expensive/common handlers - not all situations are created equal, and nor should they be treated this way.
+1. A focus on the developer. Many other osu! server implementations are far too complicated for the job, either in an
+   'overkill' sense, or through poor abstraction. With this project I aim to keep the code as simple and concise as
+   possible, while still maintaining high performance and providing an accurate representation of osu!'s protocol.
+
+   Developing features for the server should be an enjoyable and thought-provoking experience of finding new ideas;
+   when the codebase makes that difficult, programming loses the aspect of fun and everything becomes an activity
+   that requires effort - I'm trying my best to never let this code get to that state, as it's mostly what drove me to
+   start this project to begin with.
+
+## Requirements
+
+- MySQL & Nginx (both installed in setup below)
+- Some know-how with Linux (tested on Ubuntu 18.04), python, and general-programming knowledge.
+- An osu! account (or more specifically, an osu! api key). This is technically optional, but is required for full feature-set.
 
 ## Setup
 
-Setup is pretty simple, the commands below should basically be copy-pastable.
+Setup is relatively simple, the commands below should basically be copy-pastable.
 
-If you have any difficulties setting up gulag, you can contact me via Discord @ cmyui#0425 for support.
+If you have any difficulties setting up gulag, feel free to join the Discord server at the top of the README, we now have a bit of a community!
+
+NOTE: I will not be able to help you out with creating a certificate to connect on the latest osu! versions.
 
 ```sh
 # Install our database & reverse proxy, if not already installed.
@@ -38,11 +56,10 @@ git clone https://github.com/cmyui/gulag.git
 cd gulag
 
 # Create empty data directories.
-mkdir certs screenshots replays logs pp/maps
+mkdir screenshots replays logs mapsets avatars pp/maps
 
-# Install pipenv and requirements.
-python3.8 -m pip install pipenv --user
-python3.8 -m pipenv install
+# Install project requirements.
+python3.8 -m pip install -r requirements.txt
 
 # Import the database structure.
 # NOTE: create an empty database before doing this.
@@ -53,18 +70,12 @@ mysql -u your_sql_username -p your_db_name < db.sql
 # NOTE: default unix socket location is `/tmp/gulag.sock`.
 sudo ln nginx.conf /etc/nginx/sites-enabled/gulag.conf
 
-# Reload nginx after adding new config.
+# Reload nginx to put the reverse proxy online.
 sudo nginx -s reload
 
 # Configure gulag.
 mv config.sample.py config.py
 nano config.py
-
-# Create certificate.
-# When filling this out, set 'Common Name' to '*.ppy.sh', the rest are unimportant.
-# You'll need to install this on windows like after creating it.
-# You'll also need to edit nginx.conf's certificate paths to the ones created here.
-openssl req -newkey rsa:4096 -x509 -sha256 -days 3650 -nodes -out certs/server.crt -keyout certs/server.key
 
 # Start the server.
 python3.8 main.py

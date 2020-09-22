@@ -1,9 +1,9 @@
 /.vscode
-/__pycache__
+__pycache__/
 /config.py
 /logs
 /screenshots
 /replays
-pp/oppai
-pp/maps
-Pipfile.lock
+/mapsets
+/pp/oppai
+/pp/maps

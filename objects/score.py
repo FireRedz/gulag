@@ -1,14 +1,15 @@
 
 from typing import Final, Tuple, Optional
 from enum import IntEnum, unique
-from time import time
+import time
+import os
+import base64
 from py3rijndael import RijndaelCbc, ZeroPadding
-from base64 import b64decode
 
 from pp.owoppai import Owoppai
 from constants.mods import Mods
 from constants.clientflags import ClientFlags
-from console import printlog, Ansi
+from console import plog, Ansi
 
 from objects.beatmap import Beatmap
 from objects.player import Player
@@ -31,6 +32,7 @@ class Rank(IntEnum):
     C:  Final[int] = 6
     D:  Final[int] = 7
     F:  Final[int] = 8
+    N:  Final[int] = 9
 
     def __str__(self) -> str:
         return {
@@ -67,7 +69,7 @@ class Score:
     id: :class:`int`
         The score's unique ID.
 
-    map: Optional[:class:`Beatmap`]
+    bmap: Optional[:class:`Beatmap`]
         A beatmap obj representing the osu map.
 
     player: Optional[:class:`Player`]
@@ -127,22 +129,25 @@ class Score:
     play_time: :class:`int`
         A UNIX timestamp of the time of score submission.
 
+    time_elapsed: :class:`int`
+        The total elapsed time of the play (in seconds).
+
     client_flags: :class:`int`
         osu!'s old anticheat flags.
     """
     __slots__ = (
-        'id', 'map', 'player',
+        'id', 'bmap', 'player',
         'pp', 'score', 'max_combo', 'mods',
         'acc', 'n300', 'n100', 'n50', 'nmiss', 'ngeki', 'nkatu', 'grade',
         'rank', 'passed', 'perfect', 'status',
-        'game_mode', 'play_time',
+        'game_mode', 'play_time', 'time_elapsed',
         'client_flags'
     )
 
     def __init__(self):
         self.id = 0
 
-        self.map: Optional[Beatmap] = None
+        self.bmap: Optional[Beatmap] = None
         self.player: Optional[Player] = None
 
         self.pp = 0.0
@@ -168,36 +173,38 @@ class Score:
 
         self.game_mode = 0
         self.play_time = 0
+        self.time_elapsed = 0
 
         # osu!'s client 'anticheat'.
         self.client_flags = ClientFlags.Clean
 
     @classmethod
-    def from_submission(cls, data_enc: str, iv: str,
-                        osu_ver: str, pass_md5: str) -> None:
+    async def from_submission(cls, data_enc: str, iv: str,
+                              osu_ver: str, phash: str) -> None:
         """Create a score object from an osu! submission string."""
-        aes_key = f'osu!-scoreburgr---------{osu_ver}'
         cbc = RijndaelCbc(
             f'osu!-scoreburgr---------{osu_ver}',
-            iv = b64decode(iv).decode('latin_1'),
+            iv = base64.b64decode(iv).decode('latin_1'),
             padding = ZeroPadding(32), block_size =  32
         )
 
-        data = cbc.decrypt(b64decode(data_enc).decode('latin_1')).decode().split(':')
+        data = cbc.decrypt(base64.b64decode(data_enc).decode('latin_1')).decode().split(':')
 
         if len(data) != 18:
-            printlog('Received an invalid score submission.', Ansi.LIGHT_RED)
-            return None
+            await plog('Received an invalid score submission.', Ansi.LIGHT_RED)
+            return
 
         s = cls()
 
         if len(map_md5 := data[0]) != 32:
             return
 
-        s.map = Beatmap.from_md5(map_md5)
+        pname = data[1].rstrip() # why does osu! make me rstrip lol
 
-        # why does osu! make me rstrip lol
-        s.player = glob.players.get_from_cred(data[1].rstrip(), pass_md5)
+        # Get the map & player for the score.
+        s.bmap = await Beatmap.from_md5(map_md5)
+        s.player = await glob.players.get_login(pname, phash)
+
         if not s.player:
             # Return the obj with an empty player to
             # determine whether the score faield to
@@ -211,30 +218,37 @@ class Score:
         # Perhaps will use to improve security at some point?
 
         # Ensure all ints are safe to cast.
-        if not all(i.isnumeric() for i in data[3:11] + [data[13] + data[15]]):
-            printlog('Invalid parameter passed into submit-modular.', Ansi.LIGHT_RED)
+        if not all(i.isdecimal() for i in data[3:11] + [data[13], data[15]]):
+            await plog('Invalid parameter passed into submit-modular.', Ansi.LIGHT_RED)
             return
 
-        s.n300, s.n100, s.n50, s.ngeki, s.nkatu, s.nmiss, \
-        s.score, s.max_combo = (int(i) for i in data[3:11])
+        (s.n300, s.n100, s.n50, s.ngeki, s.nkatu, s.nmiss,
+         s.score, s.max_combo) = (int(i) for i in data[3:11])
 
         s.perfect = data[11] == '1'
-        s.grade = data[12] # letter grade
+        _grade = data[12] # letter grade
         s.mods = int(data[13])
         s.passed = data[14] == 'True'
         s.game_mode = int(data[15])
-        s.play_time = int(time()) # (yyMMddHHmmss)
+        s.play_time = int(time.time()) # (yyMMddHHmmss)
         s.client_flags = data[17].count(' ') # TODO: use osu!ver? (osuver\s+)
+
+        s.grade = _grade if s.passed else 'F'
 
         # All data read from submission.
         # Now we can calculate things based on our data.
         s.calc_accuracy()
 
-        if s.map:
+        if s.bmap:
             # Ignore SR for now.
-            s.pp = s.calc_diff()[0]
-            s.calc_status()
-            s.rank = s.calc_lb_placement()
+            if not os.path.exists('pp/oppai'):
+                await plog('Missing pp calculator (pp/oppai)', Ansi.LIGHT_RED)
+                s.pp = 0.0
+            else:
+                s.pp = (await s.calc_diff())[0]
+
+            await s.calc_status()
+            s.rank = await s.calc_lb_placement()
         else:
             s.pp = 0.0
             s.status = SubmissionStatus.SUBMITTED if s.passed \
@@ -242,7 +256,7 @@ class Score:
 
         return s
 
-    def calc_lb_placement(self) -> int:
+    async def calc_lb_placement(self) -> int:
         if self.mods & Mods.RELAX:
             table = 'scores_rx'
             scoring = 'pp'
@@ -252,11 +266,11 @@ class Score:
             scoring = 'score'
             score = self.pp
 
-        res = glob.db.fetch(
+        res = await glob.db.fetch(
             'SELECT COUNT(*) AS c FROM {t} '
             'WHERE map_md5 = %s AND game_mode = %s '
             'AND status = 2 AND {s} > %s'.format(t = table, s = scoring), [
-                self.map.md5, self.game_mode, score
+                self.bmap.md5, self.game_mode, score
             ]
         )
 
@@ -265,39 +279,40 @@ class Score:
     # Could be staticmethod?
     # We'll see after some usage of gulag
     # whether it's beneficial or not.
-    def calc_diff(self) -> Tuple[float, float]:
+    async def calc_diff(self) -> Tuple[float, float]:
         """Calculate PP and star rating for our score."""
-        if self.game_mode not in {0, 1}:
+        if self.game_mode not in (0, 1):
             # Currently only std and taiko are supported,
             # since we are simply using oppai-ng alone.
             return (0.0, 0.0)
 
-        owpi: Owoppai = Owoppai(
-            map_id = self.map.id,
-            mods = self.mods,
-            combo = self.max_combo,
-            misses = self.nmiss,
-            gamemode = self.game_mode,
-            accuracy = self.acc
-        )
+        pp_params = {
+            'mods': self.mods,
+            'combo': self.max_combo,
+            'nmiss': self.nmiss,
+            'mode': self.game_mode,
+            'acc': self.acc
+        }
 
-        # Returns (pp, sr)
-        return owpi.calculate_pp()
+        async with Owoppai(self.bmap.id, **pp_params) as owo:
+            ret = (owo.pp, owo.stars)
 
-    def calc_status(self) -> None:
+        return ret
+
+    async def calc_status(self) -> None:
         if not self.passed:
             self.status = SubmissionStatus.FAILED
             return
 
         table = 'scores_rx' if self.mods & Mods.RELAX else 'scores_vn'
 
-        # try to find a better pp score than this one.
-        # if this exists, it will be s=1
-        res = glob.db.fetch(
+        # Try to find a better score; if
+        # one exists, it will be status=1.
+        res = await glob.db.fetch(
             f'SELECT 1 FROM {table} WHERE userid = %s '
             'AND map_md5 = %s AND game_mode = %s '
             'AND pp > %s AND status = 2', [
-                self.player.id, self.map.md5,
+                self.player.id, self.bmap.md5,
                 self.game_mode, self.pp
             ]
         )
@@ -307,7 +322,8 @@ class Score:
 
     def calc_accuracy(self) -> None:
         if self.game_mode == 0: # osu!
-            if not (total := sum((self.n300, self.n100, self.n50, self.nmiss))):
+            if not (total := sum((self.n300, self.n100,
+                                  self.n50, self.nmiss))):
                 self.acc = 0.0
                 return
 
@@ -318,7 +334,8 @@ class Score:
             )) / (total * 300.0)
 
         elif self.game_mode == 1: # osu!taiko
-            if not (total := sum((self.n300, self.n100, self.nmiss))):
+            if not (total := sum((self.n300, self.n100,
+                                  self.nmiss))):
                 self.acc = 0.0
                 return
 
@@ -329,7 +346,8 @@ class Score:
 
         elif self.game_mode == 2:
             # osu!catch
-            pass
+            NotImplemented
+
         elif self.game_mode == 3:
             # osu!mania
-            pass
+            NotImplemented
