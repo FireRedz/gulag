@@ -1,90 +1,232 @@
 # -*- coding: utf-8 -*-
 
-from typing import (Sequence, Dict, Optional,
-                    Union, Callable, Final)
+import asyncio
+from utils.recalculator import PPCalculator
+from typing import (NamedTuple, Sequence, Optional,
+                    Union, Callable, TYPE_CHECKING)
 import time
+import re
+import cmyui
 import random
+from datetime import datetime
 from collections import defaultdict
 
 import packets
-from objects import glob
-from objects.player import Player
-from objects.channel import Channel
-from objects.beatmap import Beatmap, RankedStatus
-from objects.match import Match, SlotStatus
+
 from constants.privileges import Privileges
+from constants.mods import Mods
+from constants import regexes
 
-Messageable = Union[Channel, Player]
-CommandResponse = Dict[str, str]
+from objects import glob
+from objects.clan import Clan, ClanRank
+from objects.score import SubmissionStatus
+from objects.beatmap import Beatmap, RankedStatus
+from objects.match import (MapPool, MatchWinConditions,
+                           MatchTeamTypes, SlotStatus, MatchTeams)
 
-# Not sure if this should be in glob or not,
+if TYPE_CHECKING:
+    from objects.channel import Channel
+    from objects.player import Player
+    from objects.match import Match
+
+Messageable = Union['Channel', 'Player']
+CommandResponse = dict[str, str]
+
+class Command(NamedTuple):
+    triggers: list[str]
+    callback: Callable
+    priv: Privileges
+    public: bool
+    doc: str
+
+class CommandSet:
+    __slots__ = ('commands', 'trigger')
+
+    def __init__(self, trigger: str) -> None:
+        self.trigger = trigger
+        self.commands: list[Command] = []
+
+    def add(self, priv: Privileges, public: bool,
+            triggers: list[str] = []) -> Callable:
+        def wrapper(f: Callable):
+            self.commands.append(Command(
+                # NOTE: this method assumes that functions without any
+                # triggers will be named like '{self.trigger}_{trigger}'.
+                triggers = triggers or [f.__name__.removeprefix(f'{self.trigger}_')],
+                callback = f, priv = priv,
+                public = public, doc = f.__doc__
+            ))
+
+            return f
+        return wrapper
+
+# TODO: refactor help commands into some base ver
+#       since they're all the same anyways lol.
+
+# not sure if this should be in glob or not,
 # trying to think of some use cases lol..
-# Could be interesting?
-glob.commands = []
+mp_commands = CommandSet('mp')
+pool_commands = CommandSet('pool')
+clan_commands = CommandSet('clan')
+
+glob.commands = {
+    'regular': [],
+    'sets': [mp_commands, pool_commands,
+             clan_commands]
+}
 
 def command(priv: Privileges, public: bool,
-            trigger: Optional[str] = None,
-            doc: Optional[str] = None) -> Callable:
-    def register_callback(callback: Callable):
-        glob.commands.append({
-            'trigger': trigger if trigger else f'!{callback.__name__}',
-            'callback': callback,
-            'priv': priv,
-            'public': public,
-            'doc': doc
-        })
+            triggers: list[str] = []) -> Callable:
+    def wrapper(callback: Callable):
+        glob.commands['regular'].append(Command(
+            triggers=triggers or [callback.__name__],
+            callback=callback,
+            priv=priv,
+            public=public,
+            doc=callback.__doc__
+        ))
 
         return callback
-    return register_callback
+    return wrapper
 
 """ User commands
 # The commands below are not considered dangerous,
-# and are granted to any unrestricted players.
+# and are granted to any unbanned players.
 """
 
-_help_doc: Final[str] = 'Show information of all documented commands.'
-@command(priv=Privileges.Normal, public=False, doc=_help_doc)
-async def help(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    return '\n'.join('{trigger}: {doc}'.format(**cmd)
-                     for cmd in glob.commands if cmd['doc']
-                     if p.priv & cmd['priv'])
+@command(triggers=['help', 'h'], priv=Privileges.Normal, public=False)
+async def _help(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Show information of all documented commands `p` can use."""
+    prefix = glob.config.command_prefix
+    cmds = []
 
-_roll_doc: Final[str] = ('Roll an n-sided die where n is the '
-                         'number you write (100 if empty).')
-@command(priv=Privileges.Normal, public=True, doc=_roll_doc)
-async def roll(p: Player, c: Messageable, msg: Sequence[str]) -> str:
+    for cmd in glob.commands['regular']:
+        if not cmd.doc or not p.priv & cmd.priv:
+            # no doc, or insufficient permissions.
+            continue
+
+        cmds.append(f'{prefix}{cmd.triggers[0]}: {cmd.doc}')
+
+    return '\n'.join(cmds)
+
+@command(priv=Privileges.Normal, public=True)
+async def roll(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Roll an n-sided die where n is the number you write (100 if empty)."""
     if msg and msg[0].isdecimal():
-        # Cap roll to 32767 to prevent spam.
-        max_roll = min(int(msg[0]), 32767)
+        max_roll = min(int(msg[0]), 0x7fff)
     else:
         max_roll = 100
 
     points = random.randrange(0, max_roll)
     return f'{p.name} rolls {points} points!'
 
-_last_doc: Final[str] = 'Show information about your most recent score.'
-@command(priv=Privileges.Normal, public=True, doc=_last_doc)
-async def last(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    if not (s := p.recent_scores[p.status.game_mode]):
-        return 'No recent score found for current mode!'
+@command(triggers=['bloodcat', 'bc'], priv=Privileges.Normal, public=True)
+async def bloodcat(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Return a bloodcat link of the user's current map (situation dependant)."""
+    bmap = None
 
-    return f'#{s.rank} @ {s.bmap.embed} ({s.pp:.2f}pp) {s.game_mode}'
+    # priority: multiplayer -> spectator -> last np
 
-_mapsearch_doc: Final[str] = ('Search map titles with '
-                              'user input as a wildcard.')
-@command(priv=Privileges.Normal, public=False, doc=_mapsearch_doc)
-async def mapsearch(p: Player, c: Messageable, msg: Sequence[str]) -> str:
+    if p.match and p.match.map_id:
+        bmap = await Beatmap.from_md5(p.match.map_md5)
+    elif p.spectating and p.spectating.status.map_id:
+        bmap = await Beatmap.from_md5(p.spectating.status.map_md5)
+    elif p.last_np:
+        bmap = p.last_np
+    else:
+        return 'No map found!'
+
+    return f'[https://bloodcat.com/d/{bmap.set_id} {bmap.full}]'
+
+@command(priv=Privileges.Normal, public=True)
+async def last(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Show information about your most recent score."""
+    if not (s := p.recent_score):
+        return 'No scores found :o (only saves per play session)'
+
+    l = [f'[{s.mode!r}] {s.bmap.embed} +{s.mods!r} {s.acc:.2f}%']
+
+    if s.passed:
+        rank = s.rank if s.status == SubmissionStatus.BEST else 'NA'
+        l.append(f'PASS {{{s.pp:.2f}pp #{rank}}}')
+    else:
+        completion = s.time_elapsed / (s.bmap.total_length * 1000)
+        l.append(f'FAIL {{{completion * 100:.2f}% complete}})')
+
+    return ' | '.join(l)
+
+_mapsearch_fmt = (
+    '[https://osu.ppy.sh/b/{id} {artist} - {title} [{version}]] '
+    '([{mirror}/d/{set_id} download])'
+)
+_mapsearch_func = lambda row: _mapsearch_fmt.format(**row, mirror=glob.config.mirror)
+@command(priv=Privileges.Normal, public=False)
+async def mapsearch(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Search map titles with user input as a wildcard."""
+    if not msg:
+        return 'Invalid syntax: !mapsearch <title>'
+
     if not (res := await glob.db.fetchall(
         'SELECT id, set_id, artist, title, version '
-        'FROM maps WHERE title LIKE %s '
-        'LIMIT 50', [f'%{" ".join(msg)}%']
+        'FROM maps WHERE title LIKE %s LIMIT 25',
+        [f'%{" ".join(msg)}%']
     )): return 'No matches found :('
 
-    return '\n'.join(
-        '[https://osu.gatari.pw/d/{set_id} DL] '
-        '[https://osu.ppy.sh/b/{id} {artist} - {title} [{version}]]'.format(**row)
-        for row in res
-    ) + f'\nMaps: {len(res)}'
+    return '\n'.join(map(_mapsearch_func, res)) + f'\nMaps: {len(res)}'
+
+@command(triggers=['with'], priv=Privileges.Normal, public=False)
+async def _with(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Specify custom accuracy & mod combinations with `/np`."""
+    if c is not glob.bot:
+        return 'This command can only be used in DM with Aika.'
+
+    if not p.last_np:
+        return 'Please /np a map first!'
+
+    # +?<mods> <acc>%?
+    if 1 < len(msg) > 2:
+        return 'Invalid syntax: !with <mods/acc> ...'
+
+    mods = acc = None
+
+    for param in (p.strip('+%') for p in msg):
+        if cmyui._isdecimal(param, _float=True):
+            if not 0 <= (acc := float(param)) <= 100:
+                return 'Invalid accuracy.'
+
+        elif ~len(param) & 1: # len(param) % 2 == 0
+            mods = Mods.from_str(param)
+        else:
+            return 'Invalid syntax: !with <mods/acc> ...'
+
+    _msg = [p.last_np.embed]
+    if not mods:
+        mods = Mods.NOMOD
+
+    _msg.append(f'{mods!r}')
+
+    if acc:
+        # custom accuracy specified, calculate it on the fly.
+        ppcalc = await PPCalculator.from_id(p.last_np.id, acc=acc, mods=mods)
+        if not ppcalc:
+            return 'Could not retrieve map file.'
+
+        pp, _ = await ppcalc.perform() # don't need sr
+        pp_values = [(acc, pp)]
+    else:
+        # general accuracy values requested.
+        if mods not in p.last_np.pp_cache:
+            # cache
+            await p.last_np.cache_pp(mods)
+
+        pp_values = zip(
+            (90, 95, 98, 99, 100),
+            p.last_np.pp_cache[mods]
+        )
+
+    pp_msg = ' | '.join(f'{acc:.2f}%: {pp:.2f}pp'
+                        for acc, pp in pp_values)
+    return f"{' '.join(_msg)}: {pp_msg}"
 
 """ Nominators commands
 # The commands below allow users to
@@ -92,17 +234,15 @@ async def mapsearch(p: Player, c: Messageable, msg: Sequence[str]) -> str:
 """
 
 status_to_id = lambda s: {
-    'rank': 2,
     'unrank': 0,
+    'rank': 2,
     'love': 5
 }[s]
-_map_doc: Final[str] = ("Changes the ranked status of "
-                        "the most recently /np'ed map.")
-@command(priv=Privileges.Nominator, public=True, doc=_map_doc)
-async def map(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    if len(msg) != 2 \
-    or msg[0] not in ('rank', 'unrank', 'love') \
-    or msg[1] not in ('set', 'map'):
+@command(triggers=['map'], priv=Privileges.Nominator, public=True)
+async def _map(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Changes the ranked status of the most recently /np'ed map."""
+    if len(msg) != 2 or msg[0] not in ('rank', 'unrank', 'love') \
+                     or msg[1] not in ('set', 'map'):
         return 'Invalid syntax: !map <rank/unrank/love> <map/set>'
 
     if not p.last_np:
@@ -115,10 +255,11 @@ async def map(p: Player, c: Messageable, msg: Sequence[str]) -> str:
     # for updating cache would be faster?
     # surely this will not scale as well..
 
-    if msg[1] == 'set': # update whole set
+    if msg[1] == 'set':
+        # update whole set
         await glob.db.execute(
-            'UPDATE maps SET status = %s '
-            'WHERE set_id = %s',
+            'UPDATE maps SET status = %s, '
+            'frozen = 1 WHERE set_id = %s',
             [new_status, p.last_np.set_id]
         )
 
@@ -127,77 +268,172 @@ async def map(p: Player, c: Messageable, msg: Sequence[str]) -> str:
             if cached['map'].set_id == p.last_np.set_id:
                 cached['map'].status = RankedStatus(new_status)
 
-    else: # update only map
+    else:
+        # update only map
         await glob.db.execute(
-            'UPDATE maps SET status = %s '
-            'WHERE id = %s',
+            'UPDATE maps SET status = %s, '
+            'frozen = 1 WHERE id = %s',
             [new_status, p.last_np.id]
         )
 
         for cached in glob.cache['beatmap'].values():
             # not going to bother checking timeout
-            if cached['map'].id == p.last_np.id:
+            if cached['map'] is p.last_np:
                 cached['map'].status = RankedStatus(new_status)
                 break
 
     return 'Map updated!'
+
+""" Mod commands
+# The commands below are somewhat dangerous,
+# and are generally for managing players.
+"""
+
+@command(priv=Privileges.Mod, public=False)
+async def notes(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Retrieve the logs of a specified player by name."""
+    if len(msg) != 2 or not msg[1].isdecimal():
+        return 'Invalid syntax: !notes <name> <days_back>'
+
+    if not (t := await glob.players.get(name=msg[0], sql=True)):
+        return f'"{msg[0]}" not found.'
+
+    if (days := int(msg[1])) > 365:
+        return 'Please contact a developer to fetch >365 day old information.'
+
+    res = await glob.db.fetchall(
+        'SELECT `msg`, `time` '
+        'FROM `logs` WHERE `to` = %s '
+        'AND UNIX_TIMESTAMP(`time`) >= UNIX_TIMESTAMP(NOW()) - %s '
+        'ORDER BY `time` ASC',
+        [t.id, days * 86400]
+    )
+
+    return '\n'.join(map(lambda row: '[{time}] {msg}'.format(**row), res))
+
+@command(priv=Privileges.Mod, public=False)
+async def addnote(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Add a note to a specified player by name."""
+    if len(msg) < 2:
+        return 'Invalid syntax: !addnote <name> <note ...>'
+
+    if not (t := await glob.players.get(name=msg[0], sql=True)):
+        return f'"{msg[0]}" not found.'
+
+    log_msg = f'{p} added note: {" ".join(msg[1:])}'
+
+    await glob.db.execute(
+        'INSERT INTO logs (`from`, `to`, `msg`, `time`) '
+        'VALUES (%s, %s, %s, NOW())',
+        [p.id, t.id, log_msg]
+    )
+
+    return f'Added note to {p}.'
+
+@command(priv=Privileges.Mod, public=False)
+async def silence(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Silence `p` with a specified duration & reason."""
+    if len(msg) < 3:
+        return 'Invalid syntax: !silence <name> <duration> <reason>'
+
+    if not (t := await glob.players.get(name=msg[0], sql=True)):
+        return f'"{msg[0]}" not found.'
+
+    if t.priv & Privileges.Staff and not p.priv & Privileges.Dangerous:
+        return 'Only developers can manage staff members.'
+
+    if not (rgx := regexes.silence_duration.match(msg[1])):
+        return 'Invalid syntax: !silence <name> <duration> <reason>'
+
+    multiplier = {
+        's': 1, 'm': 60, 'h': 3600,
+        'd': 86400, 'w': 604800
+    }[rgx['scale']]
+
+    duration = int(rgx['duration']) * multiplier
+    reason = ' '.join(msg[2:])
+
+    await t.silence(p, duration, reason)
+    return f'{t} was silenced.'
+
+@command(priv=Privileges.Mod, public=False)
+async def unsilence(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Unsilence `p`."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !unsilence <name>'
+
+    if not (t := await glob.players.get(name=msg[0], sql=True)):
+        return f'"{msg[0]}" not found.'
+
+    if not t.silenced:
+        return f'{t} is not silenced.'
+
+    if t.priv & Privileges.Staff and not p.priv & Privileges.Dangerous:
+        return 'Only developers can manage staff members.'
+
+    await t.unsilence(p)
+    return f'{t} was unsilenced.'
 
 """ Admin commands
 # The commands below are relatively dangerous,
 # and are generally for managing players.
 """
 
-_ban_doc: Final[str] = "Ban a player's account, with a reason."
-@command(priv=Privileges.Admin, public=False, doc=_ban_doc)
-async def ban(p: Player, c: Messageable, msg: Sequence[str]) -> str:
+@command(priv=Privileges.Admin, public=False)
+async def ban(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Ban a player's account, with a reason."""
     if len(msg) < 2:
         return 'Invalid syntax: !ban <name> <reason>'
 
-    # Find any user matching (including offline).
-    if not (t := await glob.players.get_by_name(msg[0], sql=True)):
+    # find any user matching (including offline).
+    if not (t := await glob.players.get(name=msg[0], sql=True)):
         return f'"{msg[0]}" not found.'
 
     if t.priv & Privileges.Staff and not p.priv & Privileges.Dangerous:
         return 'Only developers can manage staff members.'
 
-    await t.restrict() # TODO: use reason as param?
+    reason = ' '.join(msg[1:])
+
+    await t.ban(p, reason)
     return f'{t} was banned.'
 
-_unban_doc: Final[str] = "Unban a player's account, with a reason."
-@command(priv=Privileges.Admin, public=False, doc=_unban_doc)
-async def unban(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    if len(msg) < 2:
+@command(priv=Privileges.Admin, public=False)
+async def unban(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Unban a player's account, with a reason."""
+    if (len_msg := len(msg)) < 2:
         return 'Invalid syntax: !ban <name> <reason>'
 
-    # Find any user matching (including offline).
-    if not (t := await glob.players.get_by_name(msg[0], sql=True)):
+    # find any user matching (including offline).
+    if not (t := await glob.players.get(name=msg[0], sql=True)):
         return f'"{msg[0]}" not found.'
 
     if t.priv & Privileges.Staff and not p.priv & Privileges.Dangerous:
         return 'Only developers can manage staff members.'
 
-    await t.unrestrict() # TODO: use reason as param?
+    reason = ' '.join(msg[2:]) if len_msg > 2 else None
+
+    await t.unban(p, reason)
     return f'{t} was unbanned.'
 
-_alert_doc: Final[str] = 'Send a notification to all players.'
-@command(priv=Privileges.Admin, public=False, doc=_alert_doc)
-async def alert(p: Player, c: Messageable, msg: Sequence[str]) -> str:
+@command(priv=Privileges.Admin, public=False)
+async def alert(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Send a notification to all players."""
     if len(msg) < 1:
         return 'Invalid syntax: !alert <msg>'
 
-    glob.players.enqueue(await packets.notification(' '.join(msg)))
+    glob.players.enqueue(packets.notification(' '.join(msg)))
     return 'Alert sent.'
 
-_alertu_doc: Final[str] = 'Send a notification to a specific player by name.'
-@command(trigger='!alertu', priv=Privileges.Admin, public=False, doc=_alertu_doc)
-async def alert_user(p: Player, c: Messageable, msg: Sequence[str]) -> str:
+@command(triggers=['alertu'], priv=Privileges.Admin, public=False)
+async def alert_user(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Send a notification to a specific player by name."""
     if len(msg) < 2:
         return 'Invalid syntax: !alertu <name> <msg>'
 
-    if not (t := await glob.players.get_by_name(msg[0])):
+    if not (t := await glob.players.get(name=msg[0])):
         return 'Could not find a user by that name.'
 
-    t.enqueue(await packets.notification(' '.join(msg[1:])))
+    t.enqueue(packets.notification(' '.join(msg[1:])))
     return 'Alert sent.'
 
 """ Developer commands
@@ -205,41 +441,96 @@ async def alert_user(p: Player, c: Messageable, msg: Sequence[str]) -> str:
 # simply not useful for any other roles.
 """
 
-_rtx_doc: Final[str] = 'Send an RTX packet with a message to a user.'
-@command(priv=Privileges.Dangerous, public=False, doc=_rtx_doc)
-async def rtx(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    if len(msg) != 2:
-        return 'Invalid syntax: !rtx <name> <msg>'
+@command(priv=Privileges.Dangerous, public=True)
+async def recalc(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Performs a full PP recalc on a specified map, or all maps."""
+    if len(msg) != 1 or msg[0] not in ('map', 'all'):
+        return 'Invalid syntax: !recalc <map/all>'
 
-    if not (t := await glob.players.get_by_name(msg[0])):
-        return 'Could not find a user by that name.'
+    score_counts = [] # keep track of # of scores recalced
 
-    t.enqueue(await packets.RTX(msg[1]))
-    return 'pong'
+    if msg[0] == 'map':
+        # recalculate all scores on their last /np'ed map.
+        if not p.last_np:
+            return 'You must /np a map first!'
 
-# XXX: Not very useful, mostly just for testing/fun.
-_spack_doc: Final[str] = 'Send a specific (empty) packet by id to a player.'
-@command(trigger='!spack', priv=Privileges.Dangerous, public=False, doc=_spack_doc)
-async def send_empty_packet(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    if len(msg) < 2 or not msg[-1].isdecimal():
-        return 'Invalid syntax: !spack <name> <packetid>'
+        ppcalc = await PPCalculator.from_id(p.last_np.id)
+        if not ppcalc:
+            return 'Could not retrieve map file.'
 
-    if not (t := await glob.players.get_by_name(' '.join(msg[:-1]))):
-        return 'Could not find a user by that name.'
+        await c.send(glob.bot, f'Performing full recalc on {p.last_np.embed}.')
 
-    packet = packets.Packet(int(msg[-1]))
-    t.enqueue(await packets.write(packet))
-    return f'Wrote {packet} to {t}.'
+        for table in ('scores_vn', 'scores_rx', 'scores_ap'):
+            # fetch all scores from the table on this map
+            scores = await glob.db.fetchall(
+                'SELECT id, acc, mods, max_combo, '
+                'n300, n100, n50, nmiss, ngeki, nkatu '
+                f'FROM {table} WHERE map_md5 = %s '
+                'AND status = 2 AND mode = 0',
+                [p.last_np.md5]
+            )
 
-_debug_doc: Final[str] = "Toggle the console's debug setting."
-@command(priv=Privileges.Dangerous, public=False, doc=_debug_doc)
-async def debug(p: Player, c: Messageable, msg: Sequence[str]) -> str:
+            score_counts.append(len(scores))
+
+            if not scores:
+                continue
+
+            for score in scores:
+                ppcalc.mods = Mods(score['mods'])
+                ppcalc.combo = score['max_combo']
+                ppcalc.nmiss = score['nmiss']
+                ppcalc.acc = score['acc']
+
+                pp, _ = await ppcalc.perform() # sr not needed
+
+                await glob.db.execute(
+                    f'UPDATE {table} '
+                    'SET pp = %s '
+                    'WHERE id = %s',
+                    [pp, score['id']]
+                )
+
+    else:
+        # recalculate all scores on every map
+        if not p.priv & Privileges.Dangerous:
+            return 'This command is limited to developers.'
+
+        return 'TODO'
+
+    recap = '{0} vn | {1} rx | {2} ap'.format(*score_counts)
+    return f'Recalculated {sum(score_counts)} ({recap}) scores.'
+
+@command(triggers=['switchserv'], priv=Privileges.Dangerous, public=False)
+async def switch_server(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Switch servers to a specified ip address."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !switch <endpoint>'
+
+    p.enqueue(packets.switchTournamentServer(msg[0]))
+    return 'Have a nice journey..'
+
+# rest in peace rtx - oct 2020 :candle:
+#@command(priv=Privileges.Dangerous, public=False)
+#async def rtx(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+#    """Send an RTX packet with a message to a user."""
+#    if len(msg) != 2:
+#        return 'Invalid syntax: !rtx <name> <msg>'
+#
+#    if not (t := await glob.players.get(name=msg[0])):
+#        return 'Could not find a user by that name.'
+#
+#    t.enqueue(packets.RTX(msg[1]))
+#    return 'pong'
+
+@command(priv=Privileges.Dangerous, public=False)
+async def debug(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Toggle the console's debug setting."""
     glob.config.debug = not glob.config.debug
-
     return f"Toggled {'on' if glob.config.debug else 'off'}."
 
-str_to_priv = lambda p: defaultdict(lambda: None, {
+str_priv_dict = defaultdict(lambda: None, {
     'normal': Privileges.Normal,
+    'verified': Privileges.Verified,
     'whitelisted': Privileges.Whitelisted,
     'supporter': Privileges.Supporter,
     'premium': Privileges.Premium,
@@ -248,165 +539,999 @@ str_to_priv = lambda p: defaultdict(lambda: None, {
     'mod': Privileges.Mod,
     'admin': Privileges.Admin,
     'dangerous': Privileges.Dangerous
-})[p]
-_setpriv_doc: Final[str] = 'Set privileges for a player (by name).'
-@command(priv=Privileges.Dangerous, public=False, doc=_setpriv_doc)
-async def setpriv(p: Player, c: Messageable, msg: Sequence[str]) -> str:
+})
+@command(priv=Privileges.Dangerous, public=False)
+async def setpriv(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Set privileges for a player (by name)."""
     if len(msg) < 2:
-        return 'Invalid syntax: !setpriv <name> <role1 | role2 | ...>'
+        return 'Invalid syntax: !setpriv <name> <role1 role2 role3 ...>'
 
-    # A mess that gets each unique privilege out of msg.
-    # TODO: rewrite to be at least a bit more readable..
-    priv = [str_to_priv(i) for i in set(''.join(msg[1:]).replace(' ', '').lower().split('|'))]
-    if any(x is None for x in priv):
-        return 'Invalid privileges.'
+    priv = Privileges(0)
 
-    if not (t := await glob.players.get_by_name(msg[0], sql=True)):
+    for m in msg[1:]:
+        if not (_priv := str_priv_dict[m]):
+            return f'Not found: {m}.'
+
+        priv |= _priv
+
+    if not (t := await glob.players.get(name=msg[0], sql=True)):
         return 'Could not find user.'
 
-    await glob.db.execute('UPDATE users SET priv = %s WHERE id = %s',
-                    [newpriv := sum(priv), t.id])
+    await t.update_privs(priv)
+    return f"Updated {t}'s privileges."
 
-    t.priv = Privileges(newpriv)
-    return 'Success.'
+# temp command, to illustrate how menu options will work
+@command(triggers=['men'], priv=Privileges.Dangerous, public=False)
+async def menu_preview(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    async def callback():
+        # this is called when the menu item is clicked
+        p.enqueue(packets.notification('clicked!'))
 
-# XXX: This actually comes in handy sometimes, I initially
-# wrote it completely as a joke, but I might keep it in for
+    # add the option to their menu opts & send them a button
+    opt_id = await p.add_to_menu(callback)
+    return f'[osu://dl/{opt_id} option]'
+
+# XXX: this actually comes in handy sometimes, i initially
+# wrote it completely as a joke, but i might keep it in for
 # devs.. Comes in handy when debugging to be able to run something
-# like `!ev print(await glob.players.get_by_name('cmyui').status.action)`
+# like `!py return (await glob.players.get(name='cmyui')).status.action`
 # or for anything while debugging on-the-fly..
-@command(priv=Privileges.Dangerous, public=False)
-async def ex(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    lines = '\n '.join(' '.join(msg).split('\\n'))
-    try: # pinnacle of the gulag
-        exec(f"async def __ex():\n {lines}")
-        await locals()['__ex']()
-        return 'Success.'
+@command(priv=Privileges.Dangerous, public=True)
+async def py(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    # create the new coroutine definition as a string
+    # with the lines from our message (split by '\n').
+    lines = ' '.join(msg).split(r'\n')
+    definition = '\n '.join(['async def __py(p, c, msg):'] + lines)
+
+    try:
+        # define, and run the coroutine
+        exec(definition)
+
+        loop = asyncio.get_event_loop()
+
+        try:
+            task = loop.create_task(locals()['__py'](p, c, msg))
+            ret = await asyncio.wait_for(asyncio.shield(task), 5.0)
+        except asyncio.TimeoutError:
+            ret = 'Left running (took >=5 sec).'
+
     except Exception as e:
-        return str(e)
+        # code was invalid, return
+        # the error in the osu! chat.
+        ret = f'{e.__class__}: {e}'
+
+    if ret is not None:
+        return str(ret)
+    else:
+        return 'Success'
 
 """ Multiplayer commands
 # The commands below are specifically for
 # multiplayer match management.
 """
 
-# Start a match.
-async def mp_start(p: Player, m: Match, msg: Sequence[str]) -> str:
-    for s in m.slots:
-        if s.status & SlotStatus.has_player \
-        and not s.status & SlotStatus.no_map:
-            s.status = SlotStatus.playing
+@mp_commands.add(triggers=['help', 'h'], priv=Privileges.Normal, public=True)
+async def mp_help(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    prefix = glob.config.command_prefix
+    cmds = []
 
-    m.in_progress = True
-    m.enqueue(await packets.matchStart(m))
+    for cmd in mp_commands.commands:
+        if not cmd.doc or not p.priv & cmd.priv:
+            # no doc, or insufficient permissions.
+            continue
+
+        cmds.append(f'{prefix}mp {cmd.triggers[0]}: {cmd.doc}')
+
+    return '\n'.join(cmds)
+
+@mp_commands.add(triggers=['start', 'st'], priv=Privileges.Normal, public=True)
+async def mp_start(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Start a multiplayer match."""
+    if (msg_len := len(msg)) > 1:
+        return 'Invalid syntax: !mp start <force/seconds>'
+
+    if msg_len == 1:
+        if msg[0].isdecimal():
+            # !mp start <seconds>
+            duration = int(msg[0])
+            if not 0 < duration <= 300:
+                return 'Timer range is 1-300 seconds.'
+
+            async def delayed_start(wait: int):
+                await asyncio.sleep(wait)
+
+                if p not in m:
+                    # player left match since :monkaS:
+                    return
+
+                await m.chat.send(glob.bot, 'Good luck!')
+                m.start()
+
+            asyncio.create_task(delayed_start(duration))
+            return f'Match will start in {duration} seconds.'
+        elif msg[0] not in ('force', 'f'):
+            return 'Invalid syntax: !mp start <force/seconds>'
+        # !mp start force simply passes through
+    else:
+        # !mp start (no force or timer)
+        if any(s.status == SlotStatus.not_ready for s in m.slots):
+            return ('Not all players are ready '
+                    '(use `!mp start force` to override).')
+
+    m.start()
     return 'Good luck!'
 
-# Abort a match in progress.
-async def mp_abort(p: Player, m: Match, msg: Sequence[str]) -> str:
+@mp_commands.add(triggers=['abort', 'a'], priv=Privileges.Normal, public=True)
+async def mp_abort(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Abort an in-progress multiplayer match."""
     if not m.in_progress:
         return 'Abort what?'
 
-    for s in m.slots:
-        if s.status & SlotStatus.playing:
-            s.status = SlotStatus.not_ready
+    m.unready_players(expected=SlotStatus.playing)
 
     m.in_progress = False
-    m.enqueue(await packets.updateMatch(m))
-    m.enqueue(await packets.matchAbort())
+    m.enqueue(packets.matchAbort())
+    m.enqueue_state()
     return 'Match aborted.'
 
-# Force a user into a multiplayer match by username.
-async def mp_force(p: Player, m: Match, msg: Sequence[str]) -> str:
-    if len(msg) < 1:
+@mp_commands.add(priv=Privileges.Admin, public=False)
+async def mp_force(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Force a player into the current match by name."""
+    if len(msg) != 1:
         return 'Invalid syntax: !mp force <name>'
 
-    if not (t := await glob.players.get_by_name(' '.join(msg))):
+    if not (t := await glob.players.get(name=' '.join(msg))):
         return 'Could not find a user by that name.'
 
-    await t.join_match(m)
+    await t.join_match(m, m.passwd)
     return 'Welcome.'
 
-# Set the current beatmap (by id).
-async def mp_map(p: Player, m: Match, msg: Sequence[str]) -> str:
-    if len(msg) < 1 or not msg[0].isdecimal():
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_map(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Set the current match's current map by id."""
+    if len(msg) != 1 or not msg[0].isdecimal():
         return 'Invalid syntax: !mp map <beatmapid>'
 
     if not (bmap := await Beatmap.from_bid(int(msg[0]))):
         return 'Beatmap not found.'
 
-    m.bmap = bmap
-    m.enqueue(await packets.updateMatch(m))
+    m.map_id = bmap.id
+    m.map_md5 = bmap.md5
+    m.map_name = bmap.full
+
+    m.enqueue_state()
     return f'Map selected: {bmap.embed}.'
 
-_mp_triggers = defaultdict(lambda: None, {
-    'force': {
-        'callback': mp_force,
-        'priv': Privileges.Admin
-    },
-    'abort': {
-        'callback': mp_abort,
-        'priv': Privileges.Normal
-    },
-    'start': {
-        'callback': mp_start,
-        'priv': Privileges.Normal
-    },
-    'map': {
-        'callback': mp_map,
-        'priv': Privileges.Normal
-    }
-})
-_mp_doc: Final[str] = ('A parent command to subcommands '
-                       'for multiplayer match manipulation.')
-@command(trigger='!mp', priv=Privileges.Normal, public=True, doc=_mp_doc)
-async def multiplayer(p: Player, c: Messageable, msg: Sequence[str]) -> str:
-    # Used outside of a multiplayer match.
-    if not (c._name.startswith('#multi_') and (m := p.match)):
-        return
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_mods(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Set the current match's mods, from string form."""
+    if len(msg) != 1 or not ~len(msg[0]) & 1:
+        return 'Invalid syntax: !mp mods <mods>'
 
-    # No subcommand specified, send back a list.
+    mods = Mods.from_str(msg[0])
+
+    if m.freemods:
+        if p is m.host:
+            # allow host to set speed-changing mods.
+            m.mods = mods & Mods.SPEED_CHANGING
+
+        # set slot mods
+        m.get_slot(p).mods = mods & ~Mods.SPEED_CHANGING
+    else:
+        # not freemods, set match mods.
+        m.mods = mods
+
+    m.enqueue_state()
+    return 'Match mods updated.'
+
+@mp_commands.add(triggers=['freemods', 'fm'], priv=Privileges.Normal, public=True)
+async def mp_freemods(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    if len(msg) != 1 or msg[0] not in ('on', 'off'):
+        return 'Invalid syntax: !mp freemods <on/off>'
+
+    if msg[0] == 'on':
+        # central mods -> all players mods.
+        m.freemods = True
+
+        for s in m.slots:
+            if s.status & SlotStatus.has_player:
+                # the slot takes any non-speed
+                # changing mods from the match.
+                s.mods = m.mods & ~Mods.SPEED_CHANGING
+
+        m.mods &= Mods.SPEED_CHANGING
+    else:
+        # host mods -> central mods.
+        m.freemods = False
+        host = m.get_host_slot() # should always exist
+        # the match keeps any speed-changing mods,
+        # and also takes any mods the host has enabled.
+        m.mods &= Mods.SPEED_CHANGING
+        m.mods |= host.mods
+
+    m.enqueue_state()
+    return 'Match freemod status updated.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_host(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Set the current match's current host by id."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp host <name>'
+
+    if not (t := await glob.players.get(name=' '.join(msg))):
+        return 'Could not find a user by that name.'
+
+    if t is m.host:
+        return "They're already host, silly!"
+
+    if t not in m:
+        return 'Found no such player in the match.'
+
+    m.host = t
+    m.host.enqueue(packets.matchTransferHost())
+    m.enqueue_state(lobby=False)
+    return 'Match host updated.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_randpw(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Randomize the current match's password."""
+    m.passwd = cmyui.rstring(16)
+    return 'Match password randomized.'
+
+@mp_commands.add(triggers=['invite', 'inv'], priv=Privileges.Normal, public=True)
+async def mp_invite(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Invite a player to the current match by name."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp invite <name>'
+
+    if not (t := await glob.players.get(name=msg[0])):
+        return 'Could not find a user by that name.'
+
+    if p is t:
+        return "You can't invite yourself!"
+
+    t.enqueue(packets.matchInvite(p, t.name))
+    return f'Invited {t} to the match.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_addref(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Add a referee to the current match by name."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp addref <name>'
+
+    if not (t := await glob.players.get(name=msg[0])):
+        return 'Could not find a user by that name.'
+
+    if t not in m:
+        return 'User must be in the current match!'
+
+    if t in m.refs:
+        return f'{t} is already a match referee!'
+
+    m._refs.add(t)
+    return 'Match referees updated.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_rmref(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Remove a referee from the current match by name."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp addref <name>'
+
+    if not (t := await glob.players.get(name=msg[0])):
+        return 'Could not find a user by that name.'
+
+    if t not in m.refs:
+        return f'{t} is not a match referee!'
+
+    if t is m.host:
+        return 'The host is always a referee!'
+
+    m._refs.remove(t)
+    return 'Match referees updated.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_listref(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """List all referees from the current match."""
+    return ', '.join(map(str, m.refs)) + '.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_lock(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Lock all unused slots in the current match."""
+    for slot in m.slots:
+        if slot.status == SlotStatus.open:
+            slot.status = SlotStatus.locked
+
+    m.enqueue_state()
+    return 'All unused slots locked.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_unlock(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Unlock locked slots in the current match."""
+    for slot in m.slots:
+        if slot.status == SlotStatus.locked:
+            slot.status = SlotStatus.open
+
+    m.enqueue_state()
+    return 'All locked slots unlocked.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_teams(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Change the team type for the current match."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp teams <type>'
+
+    team_type = msg[0]
+
+    if team_type in ('ffa', 'freeforall', 'head-to-head'):
+        m.team_type = MatchTeamTypes.head_to_head
+    elif team_type in ('tag', 'coop', 'co-op', 'tag-coop'):
+        m.team_type = MatchTeamTypes.tag_coop
+    elif team_type in ('teams', 'team-vs', 'teams-vs'):
+        m.team_type = MatchTeamTypes.team_vs
+    elif team_type in ('tag-teams', 'tag-team-vs', 'tag-teams-vs'):
+        m.team_type = MatchTeamTypes.tag_team_vs
+    else:
+        return 'Unknown team type. (ffa, tag, teams, tag-teams)'
+
+    # find the new appropriate default team.
+    # defaults are (ffa: neutral, teams: red).
+    if m.team_type in (MatchTeamTypes.head_to_head,
+                       MatchTeamTypes.tag_coop):
+        new_t = MatchTeams.neutral
+    else:
+        new_t = MatchTeams.red
+
+    # change each active slots team to
+    # fit the correspoding team type.
+    for s in m.slots:
+        if s.status & SlotStatus.has_player:
+            s.team = new_t
+
+    if m.is_scrimming:
+        # reset score if scrimming.
+        m.reset_scrim()
+
+    m.enqueue_state()
+    return 'Match team type updated.'
+
+@mp_commands.add(triggers=['condition', 'cond'], priv=Privileges.Normal, public=True)
+async def mp_condition(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Change the win condition for the match."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp condition <type>'
+
+    cond = msg[0]
+
+    if cond == 'pp':
+        # special case - pp can't actually be used as an ingame
+        # win condition, but gulag allows it to be passed into
+        # this command during a scrims to use pp as a win cond.
+        if not m.is_scrimming:
+            return 'PP is only useful as a win condition during scrims.'
+        if m.use_pp_scoring:
+            return 'PP scoring already enabled.'
+
+        m.use_pp_scoring = True
+    else:
+        if m.use_pp_scoring:
+            m.use_pp_scoring = False
+
+        if cond == 'score':
+            m.win_condition = MatchWinConditions.score
+        elif cond in ('accuracy', 'acc'):
+            m.win_condition = MatchWinConditions.accuracy
+        elif cond == 'combo':
+            m.win_condition = MatchWinConditions.combo
+        elif cond in ('scorev2', 'v2'):
+            m.win_condition = MatchWinConditions.scorev2
+        else:
+            return 'Invalid win condition. (score, acc, combo, scorev2, *pp)'
+
+    m.enqueue_state(lobby=False)
+    return 'Match win condition updated.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_scrim(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Start a scrim in the current match."""
+    if len(msg) != 1 \
+    or not (rgx := re.fullmatch(r'^(?:bo)?(\d{1,2})$', msg[0])):
+        return 'Invalid syntax: !mp scrim <bo#>'
+
+    if not 0 <= (best_of := int(rgx[1])) < 16:
+        return 'Best of must be in range 0-15.'
+
+    winning_pts = (best_of // 2) + 1
+
+    if winning_pts != 0:
+        # setting to real num
+        if m.is_scrimming:
+            return 'Already scrimming!'
+
+        if ~best_of & 1:
+            return 'Best of must be an odd number!'
+
+        m.is_scrimming = True
+        msg = (f'A scrimmage has been started by {p.name}; '
+               f'first to {winning_pts} points wins. Best of luck!')
+    else:
+        # setting to 0
+        if not m.is_scrimming:
+            return 'Not currently scrimming!'
+
+        m.is_scrimming = False
+        m.reset_scrim()
+        msg = 'Scrimming cancelled.'
+
+    m.winning_pts = winning_pts
+    return msg
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_endscrim(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """End the current matches ongoing scrim."""
+    if not m.is_scrimming:
+        return 'Not currently scrimming!'
+
+    m.is_scrimming = False
+    m.reset_scrim()
+    return 'Scrimmage ended.' # TODO: final score (get_score method?)
+
+@mp_commands.add(triggers=['rematch', 'rm'], priv=Privileges.Normal, public=True)
+async def mp_rematch(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Restart a scrim with the previous match points, """ \
+    """or roll back the most recent match point."""
+    if msg:
+        return 'Invalid syntax: !mp rematch'
+
+    if p is not m.host:
+        return 'Only available to the host.'
+
+    if not m.is_scrimming:
+        # re-start scrimming with old points
+        m.is_scrimming = True
+        msg = (f'A rematch has been started by {p.name}; '
+               f'first to {m.winning_pts} points wins. Best of luck!')
+    else:
+        # reset the last match point awarded
+        if not m.winners:
+            return "No match points have yet been awarded!"
+
+        if (recent_winner := m.winners[-1]) is None:
+            return 'The last point was a tie!'
+
+        m.match_points[recent_winner] -= 1 # TODO: team name
+        m.winners.pop()
+
+        msg = f'A point has been deducted from {recent_winner}.'
+
+    return msg
+
+# Mappool commands
+
+@mp_commands.add(triggers=['loadpool', 'lp'], priv=Privileges.Normal, public=True)
+async def mp_loadpool(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Load a specified mappool into the current match."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp loadpool <name>'
+
+    if p is not m.host:
+        return 'Only available to the host.'
+
+    name = msg[0]
+
+    if not (pool := glob.pools.get(name)):
+        return 'Could not find a pool by that name!'
+
+    if m.pool is pool:
+        return f'{pool!r} already selected!'
+
+    m.pool = pool
+    return f'{pool!r} selected.'
+
+@mp_commands.add(triggers=['unloadpool', 'ulp'], priv=Privileges.Normal, public=True)
+async def mp_unloadpool(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Unload the current matches mappool."""
+    if msg:
+        return 'Invalid syntax: !mp unloadpool'
+
+    if p is not m.host:
+        return 'Only available to the host.'
+
+    if not m.pool:
+        return 'No mappool currently selected!'
+
+    m.pool = None
+    return 'Mappool unloaded.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_ban(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Ban a specified pick in the current pool from being picked."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp ban <mods#>'
+
+    if not m.pool:
+        return 'No pool currently selected!'
+
+    mods_slot = msg[0]
+
+    # separate mods & slot
+    if not (rgx := re.fullmatch(r'^([a-zA-Z]+)([0-9]+)$', mods_slot)):
+        return 'Invalid <mods#> syntax; correct example: "HD2".'
+
+    mods = Mods.from_str(rgx[1])
+    slot = int(rgx[2])
+
+    if (mods, slot) not in m.pool.maps:
+        return f'Found no {mods_slot} pick in the pool.'
+
+    if (mods, slot) in m.bans:
+        return 'That pick is already banned!'
+
+    m.bans.add((mods, slot))
+    return f'{mods_slot} banned.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_unban(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Unban a specified pick in the current pool from being picked."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp unban <mods#>'
+
+    if not m.pool:
+        return 'No pool currently selected!'
+
+    mods_slot = msg[0]
+
+    # separate mods & slot
+    if not (rgx := re.fullmatch(r'^([a-zA-Z]+)([0-9]+)$', mods_slot)):
+        return 'Invalid <mods#> syntax; correct example: "HD2".'
+
+    mods = Mods.from_str(rgx[1])
+    slot = int(rgx[2])
+
+    if (mods, slot) not in m.pool.maps:
+        return f'Found no {mods_slot} pick in the pool.'
+
+    if (mods, slot) not in m.bans:
+        return 'That pick is not currently banned!'
+
+    m.bans.remove((mods, slot))
+    return f'{mods_slot} unbanned.'
+
+@mp_commands.add(priv=Privileges.Normal, public=True)
+async def mp_pick(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    """Pick a map from the currently selected mappool."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !mp pick <mods#>'
+
+    if not m.pool:
+        return 'No pool currently selected!'
+
+    mods_slot = msg[0]
+
+    # separate mods & slot
+    if not (rgx := re.fullmatch(r'^([a-zA-Z]+)([0-9]+)$', mods_slot)):
+        return 'Invalid <mods#> syntax; correct example: "HD2".'
+
+    mods = Mods.from_str(rgx[1])
+    slot = int(rgx[2])
+
+    if (mods, slot) not in m.pool.maps:
+        return f'Found no {mods_slot} pick in the pool.'
+
+    if (mods, slot) in m.bans:
+        return f'{mods_slot} has been banned from being picked.'
+
+    # update match beatmap to the picked map.
+    bmap = m.pool.maps[(mods, slot)]
+    m.map_md5 = bmap.md5
+    m.map_id = bmap.id
+    m.map_name = bmap.full
+    m.enqueue_state()
+
+    return f'Picked {bmap.embed}. ({mods_slot})'
+
+""" Mappool management commands
+# The commands below are for event managers
+# and tournament hosts/referees to help automate
+# tedious processes of running tournaments.
+"""
+
+@pool_commands.add(triggers=['help', 'h'], priv=Privileges.Tournament, public=False)
+async def pool_help(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    prefix = glob.config.command_prefix
+    cmds = []
+
+    for cmd in pool_commands.commands:
+        if not cmd.doc or not p.priv & cmd.priv:
+            # no doc, or insufficient permissions.
+            continue
+
+        cmds.append(f'{prefix}pool {cmd.triggers[0]}: {cmd.doc}')
+
+    return '\n'.join(cmds)
+
+@pool_commands.add(triggers=['create', 'c'], priv=Privileges.Tournament, public=False)
+async def pool_create(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Add a new mappool to the database."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !pool create <name>'
+
+    name = msg[0]
+
+    if glob.pools.get(name):
+        return 'Pool already exists by that name!'
+
+    # insert pool into db
+    await glob.db.execute(
+        'INSERT INTO tourney_pools '
+        '(name, created_at, created_by) '
+        'VALUES (%s, NOW(), %s)',
+        [name, p.id]
+    )
+
+    # add to cache (get from sql for id & time)
+    res = await glob.db.fetch('SELECT * FROM tourney_pools '
+                              'WHERE name = %s', [name])
+
+    glob.pools.append(MapPool(**res))
+
+    return f'{name} created.'
+
+@pool_commands.add(triggers=['delete', 'd'], priv=Privileges.Tournament, public=False)
+async def pool_delete(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Remove a mappool from the database."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !pool delete <name>'
+
+    name = msg[0]
+
+    if not (pool := glob.pools.get(name)):
+        return 'Could not find a pool by that name!'
+
+    # delete from db
+    await glob.db.execute(
+        'DELETE FROM tourney_pools '
+        'WHERE name = %s',
+        [name]
+    )
+
+    # remove from cache
+    glob.pools.remove(pool)
+
+    return f'{name} deleted.'
+
+@pool_commands.add(triggers=['add', 'a'], priv=Privileges.Tournament, public=False)
+async def pool_add(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Add a new map to a mappool in the database."""
+    if len(msg) != 2:
+        return 'Invalid syntax: !pool add <name> <mods#>'
+
+    if not p.last_np:
+        return 'Please /np a map first!'
+
+    name, mods_slot = msg
+
+    # separate mods & slot
+    if not (rgx := re.fullmatch(r'^([a-zA-Z]+)([0-9]+)$', mods_slot)):
+        return 'Invalid <mods#> syntax; correct example: "HD2".'
+
+    if not ~len(rgx[1]) & 1:
+        return 'Invalid mods.'
+
+    mods = int(Mods.from_str(rgx[1]))
+    slot = int(rgx[2])
+
+    if not (pool := glob.pools.get(name)):
+        return 'Could not find a pool by that name!'
+
+    if p.last_np in pool.maps:
+        return f'Map is already in the pool!'
+
+    # insert into db
+    await glob.db.execute(
+        'INSERT INTO tourney_pool_maps '
+        '(map_id, pool_id, mods, slot) '
+        'VALUES (%s, %s, %s, %s)',
+        [p.last_np.id, pool.id, mods, slot]
+    )
+
+    # add to cache
+    pool.maps[(Mods(mods), slot)] = p.last_np
+
+    return f'{p.last_np.embed} added to {name}.'
+
+@pool_commands.add(triggers=['remove', 'r'], priv=Privileges.Tournament, public=False)
+async def pool_remove(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Remove a map from a mappool in the database."""
+    if len(msg) != 2:
+        return 'Invalid syntax: !pool remove <name> <mods#>'
+
+    name, mods_slot = msg
+
+    # separate mods & slot
+    if not (rgx := re.fullmatch(r'^([a-zA-Z]+)([0-9]+)$', mods_slot)):
+        return 'Invalid <mods#> syntax; correct example: "HD2".'
+
+    mods = Mods.from_str(rgx[1])
+    slot = int(rgx[2])
+
+    if not (pool := glob.pools.get(name)):
+        return 'Could not find a pool by that name!'
+
+    if (mods, slot) not in pool.maps:
+        return f'Found no {mods_slot} pick in the pool.'
+
+    # delete from db
+    await glob.db.execute(
+        'DELETE FROM tourney_pool_maps '
+        'WHERE mods = %s AND slot = %s',
+        [int(mods), slot]
+    )
+
+    # remove from cache
+    del pool.maps[(mods, slot)]
+
+    return f'{mods_slot} removed from {name}.'
+
+@pool_commands.add(triggers=['list', 'l'], priv=Privileges.Tournament, public=False)
+async def pool_list(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """List all existing mappools information."""
+
+    if not (pools := glob.pools):
+        return 'There are currently no pools!'
+
+    l = [f'Mappools ({len(pools)})']
+
+    for pool in pools:
+        l.append(f'[{pool.created_at:%Y-%m-%d}] {pool.id}. {pool.name}, by {pool.created_by}.')
+
+    return '\n'.join(l)
+
+@pool_commands.add(triggers=['info', 'i'], priv=Privileges.Tournament, public=False)
+async def pool_info(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Get all information for a specific mappool."""
+    if len(msg) != 1:
+        return 'Invalid syntax: !pool info <name>'
+
+    name = msg[0]
+
+    if not (pool := glob.pools.get(name)):
+        return 'Could not find a pool by that name!'
+
+    _time = pool.created_at.strftime('%H:%M:%S%p')
+    _date = pool.created_at.strftime('%Y-%m-%d')
+    datetime_fmt = f'Created at {_time} on {_date}'
+    l = [f'{pool.id}. {pool.name}, by {pool.created_by} | {datetime_fmt}.']
+
+    for (mods, slot), bmap in pool.maps.items():
+        l.append(f'{mods!r}{slot}: {bmap.embed}')
+
+    return '\n'.join(l)
+
+""" Clan managment commands
+# The commands below are for managing gulag
+# clans, for users, clan staff, and server staff.
+"""
+
+@clan_commands.add(triggers=['help', 'h'], priv=Privileges.Normal, public=True)
+async def clan_help(p: 'Player', m: 'Match', msg: Sequence[str]) -> str:
+    prefix = glob.config.command_prefix
+    cmds = []
+
+    for cmd in clan_commands.commands:
+        if not cmd.doc or not p.priv & cmd.priv:
+            # no doc, or insufficient permissions.
+            continue
+
+        cmds.append(f'{prefix}clan {cmd.triggers[0]}: {cmd.doc}')
+
+    return '\n'.join(cmds)
+
+@clan_commands.add(triggers=['create', 'c'], priv=Privileges.Normal, public=True)
+async def clan_create(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Create a clan with a given tag & name."""
+    if p.clan:
+        return f"You're already a member of {p.clan}!"
+
+    if len(msg) < 2:
+        return 'Invalid syntax: !clan create <tag> <name>'
+
+    if not 1 <= len(tag := msg[0].upper()) <= 6:
+        return 'Clan tag may be 1-6 characters long.'
+
+    if not 2 <= len(name := ' '.join(msg[1:])) <= 16:
+        return 'Clan name may be 2-16 characters long.'
+
+    if glob.clans.get(name=name):
+        return 'That name has already been claimed by another clan.'
+
+    if glob.clans.get(tag=tag):
+        return 'That tag has already been claimed by another clan.'
+
+    created_at = datetime.now()
+
+    # add clan to sql (generates id)
+    id = await glob.db.execute(
+        'INSERT INTO clans '
+        '(name, tag, created_at, owner) '
+        'VALUES (%s, %s, %s, %s)',
+        [name, tag, created_at, p.id]
+    )
+
+    # add clan to cache
+    clan = Clan(id=id, name=name, tag=tag,
+                created_at=created_at, owner=p.id)
+    glob.clans.append(clan)
+
+    # set owner's clan & clan rank (cache & sql)
+    p.clan = clan
+    p.clan_rank = ClanRank.Owner
+
+    clan.owner = p.id
+    clan.members.add(p.id)
+
+    await glob.db.execute(
+        'UPDATE users '
+        'SET clan_id = %s, '
+        'clan_rank = 3 ' # ClanRank.Owner
+        'WHERE id = %s',
+        [id, p.id]
+    )
+
+    # TODO: take currency from player
+
+    # announce clan creation
+    if announce_chan := glob.channels['#announce']:
+        msg = f'\x01ACTION founded {clan!r}.'
+        await announce_chan.send(p, msg, to_self=True)
+
+    return f'{clan!r} created.'
+
+@clan_commands.add(triggers=['disband', 'delete', 'd'], priv=Privileges.Normal, public=True)
+async def clan_disband(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Disband a clan (admins may disband others clans)."""
+    if msg:
+        # disband a specified clan by tag
+        if p not in glob.players.staff:
+            return 'Only staff members may disband the clans of others.'
+
+        if not (clan := glob.clans.get(tag=' '.join(msg).upper())):
+            return 'Could not find a clan by that tag.'
+    else:
+        # disband the player's clan
+        if not (clan := p.clan):
+            return "You're not a member of a clan!"
+
+    # delete clan from sql
+    await glob.db.execute(
+        'DELETE FROM clans '
+        'WHERE id = %s',
+        [clan.id]
+    )
+
+    # remove all members from the clan,
+    # reset their clan rank (cache & sql).
+    # NOTE: only online players need be to be uncached.
+    for m in [await glob.players.get(id=p_id) for p_id in clan.members]:
+        m.clan = m.clan_rank = None
+
+    await glob.db.execute(
+        'UPDATE users '
+        'SET clan_id = 0, '
+        'clan_rank = 0 '
+        'WHERE clan_id = %s',
+        [clan.id]
+    )
+
+    # remove clan from cache
+    glob.clans.remove(clan)
+
+    # announce clan disbanding
+    if announce_chan := glob.channels['#announce']:
+        msg = f'\x01ACTION disbanded {clan!r}.'
+        await announce_chan.send(p, msg, to_self=True)
+
+    return f'{clan!r} disbanded.'
+
+@clan_commands.add(triggers=['info', 'i'], priv=Privileges.Normal, public=True)
+async def clan_info(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """Lookup information of a clan by tag."""
     if not msg:
-        # TODO: maybe filter to only the commands they can actually use?
-        return f"Available subcommands: {', '.join(_mp_triggers.keys())}."
+        return 'Invalid syntax: !clan info <tag>'
 
-    # No valid subcommands triggered.
-    if not (trigger := _mp_triggers[msg[0]]):
-        return 'Invalid subcommand.'
+    if not (clan := glob.clans.get(tag=' '.join(msg).upper())):
+        return 'Could not find a clan by that tag.'
 
-    # Missing privileges to use mp commands.
-    if not (p == m.host or p.priv & Privileges.Tournament):
-        return
+    owner = await glob.players.get(id=clan.owner, sql=True)
 
-    # Missing privileges to run this specific mp command.
-    if not p.priv & trigger['priv']:
-        return
+    _time = clan.created_at.strftime('%H:%M:%S%p')
+    _date = clan.created_at.strftime('%Y-%m-%d')
+    datetime_fmt = f'Founded at {_time} on {_date}'
+    msg = [f"{owner.embed}'s {clan!r} | {datetime_fmt}."]
 
-    # Forward the params to the specific command.
-    # XXX: Here, rather than sending the channel
-    # as the 2nd arg, we'll send the match obj.
-    # This is used much more frequently, and we've
-    # already asserted than p.match.chat == c anyways.
-    return await trigger['callback'](p, m, msg[1:])
+    # get members ranking from sql
+    res = await glob.db.fetchall(
+        'SELECT name, clan_rank '
+        'FROM users '
+        'WHERE clan_id = %s',
+        [clan.id], _dict=False
+    )
 
-async def process_commands(p: Player, t: Messageable,
+    for name, clan_rank in sorted(res, key=lambda row: row[1]):
+        rank_str = ('Member', 'Officer', 'Owner')[clan_rank - 1]
+        msg.append(f'[{rank_str}] {name}')
+
+    return '\n'.join(msg)
+
+@clan_commands.add(triggers=['list', 'l'], priv=Privileges.Normal, public=True)
+async def clan_list(p: 'Player', c: Messageable, msg: Sequence[str]) -> str:
+    """List all existing clans information."""
+    if msg:
+        if len(msg) != 1 or not msg[0].isdecimal():
+            return 'Invalid syntax: !clan list (page)'
+        else:
+            offset = 25 * int(msg[0])
+    else:
+        offset = 0
+
+    if offset >= (total_clans := len(glob.clans)):
+        return 'No clans found.'
+
+    msg = [f'gulag clans listing ({total_clans} total).']
+
+    for idx, clan in enumerate(glob.clans, offset):
+        msg.append(f'{idx + 1}. {clan!r}')
+
+    return '\n'.join(msg)
+
+async def process_commands(p: 'Player', t: Messageable,
                            msg: str) -> Optional[CommandResponse]:
-    # Basic commands setup for now.
-    # Response is either a CommandResponse if we hit a command,
+    # response is either a CommandResponse if we hit a command,
     # or simply False if we don't have any command hits.
     st = time.time_ns()
-    trigger, *args = msg.strip().split(' ')
+    trigger, *args = msg[len(glob.config.command_prefix):].strip().split(' ')
 
-    for cmd in glob.commands:
-        if trigger == cmd['trigger'] and p.priv & cmd['priv']:
-            # Command found & we have privileges - run it.
-            if (res := await cmd['callback'](p, t, args)):
-                # Returned a message for us to send back.
-                # Print elapsed time in milliseconds.
-                time_taken = (time.time_ns() - st) / 1000000
+    for cmd_set in glob.commands['sets']:
+        # check if any command sets match.
+        if trigger == cmd_set.trigger:
+            # matching set found;
+            if trigger == 'mp':
+                # multi set is a bit of a special case,
+                # as we do some additional checks.
+                if not (m := p.match):
+                    # player not in a match
+                    return
+
+                if t is not m.chat:
+                    # message not in match channel
+                    return
+
+                if p not in m.refs and not p.priv & Privileges.Tournament:
+                    # doesn't have privs to use !mp commands.
+                    return
+
+                t = m # send match for mp commands instead of chan
+
+            if not args:
+                # no subcommand specified,
+                # send back the set's !help cmd.
+                args = ['help']
+
+            trigger, *args = args # get subcommand
+            commands = cmd_set.commands
+            break
+    else:
+        # no set commands matched, check normal commands.
+        commands = glob.commands['regular']
+
+    for cmd in commands:
+        if trigger in cmd.triggers and p.priv & cmd.priv:
+            # command found & we have privileges, run it.
+            if res := await cmd.callback(p, t, args):
+                time_taken = (time.time_ns() - st) / 1e6
 
                 return {
                     'resp': f'{res} | Elapsed: {time_taken:.2f}ms',
-                    'public': cmd['public']
+                    'public': cmd.public
                 }
 
             return {'public': True}

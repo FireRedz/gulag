@@ -1,141 +1,119 @@
 # -*- coding: utf-8 -*-
 
-from typing import Set, Tuple, Union, Optional
-from collections import Sequence
+from objects.clan import ClanRank
+from typing import Union, Optional, TYPE_CHECKING
+from cmyui import log
 
 from objects.player import Player
-from objects.channel import Channel
-from objects.match import Match
 from constants.privileges import Privileges
 from objects import glob
-from console import plog
+
+if TYPE_CHECKING:
+    from objects.channel import Channel
+    from objects.match import Match, MapPool
+    from objects.clan import Clan
 
 __all__ = (
-    'Slice',
     'ChannelList',
     'MatchList',
-    'PlayerList'
+    'PlayerList',
+    'MapPoolList',
+    'ClanList'
 )
 
-Slice = Union[int, slice]
+class ChannelList(list):
+    """The currently active chat channels on the server."""
 
-class ChannelList(Sequence):
-    """A class to represent all chat channels on the gulag.
-
-    Attributes
-    -----------
-    channels: List[:class:`Channel`]
-        A list of channel objects representing the current chat channels.
-    """
-    __slots__ = ('channels',)
-
-    def __init__(self):
-        self.channels = []
-
-    def __getitem__(self, index: Slice) -> Channel:
-        return self.channels[index]
-
-    def __len__(self) -> int:
-        return len(self.channels)
-
-    def __contains__(self, c: Union[Channel, str]) -> bool:
-        # Allow us to either pass in the channel
-        # obj, or the channel name as a string.
-        if isinstance(c, str):
-            return c in (chan.name for chan in self.channels)
+    def __contains__(self, o: Union['Channel', str]) -> bool:
+        """Check whether internal list contains `o`."""
+        # Allow string to be passed to compare vs. name.
+        if isinstance(o, str):
+            return o in map(lambda c: c.name, self)
         else:
-            return c in self.channels
+            return super().__contains__(o)
 
-    def get(self, name: str) -> Optional[Channel]:
-        for c in self.channels:
+    def __getitem__(self, index: Union[int, slice, str]) -> 'Channel':
+        # XXX: can be either a string (to get by name),
+        # or a slice, for indexing the internal array.
+        if isinstance(index, str):
+            return self.get(index)
+        else:
+            return self[index]
+
+    def get(self, name: str) -> Optional['Channel']:
+        """Get a channel from the list by `name`."""
+        for c in self:
             if c._name == name:
                 return c
 
-    async def add(self, c: Channel) -> None:
-        if c in self.channels:
-            await plog(f'{c} already in channels list!')
-        else:
-            await plog(f'Adding {c} to channels list.')
-            self.channels.append(c)
+    def append(self, c: 'Channel') -> None:
+        """Append `c` to internal list."""
+        if glob.config.debug:
+            log(f'{c} added to channels list.')
 
-    async def remove(self, c: Channel) -> None:
-        await plog(f'Removing {c} from channels list.')
-        self.channels.remove(c)
+        return super().append(c)
 
-class MatchList(Sequence):
-    """A class to represent all multiplayer matches on the gulag.
+    def remove(self, c: 'Channel') -> None:
+        """Remove `c` from internal list."""
+        if glob.config.debug:
+            log(f'{c} removed from channels list.')
 
-    Attributes
-    -----------
-    matches: List[Optional[:class:`Match`]]
-        A list of match objects representing the current mp matches.
-        The size of this attr is constant; slots will be None if not in use.
-    """
-    __slots__ = ('matches',)
+        return super().remove(c)
 
-    def __init__(self):
-        self.matches = [None for _ in range(32)] # Max matches.
+class MatchList(list):
+    """The currently active multiplayer matches on the server."""
 
-    def __getitem__(self, index: Slice) -> Optional[Match]:
-        return self.matches[index]
+    def __init__(self) -> None:
+        super().__init__()
+        self.extend([None] * 32)
 
-    def __len__(self) -> int:
-        return len(self.matches)
-
-    def __contains__(self, m: Match) -> bool:
-        return m in self.matches
-
-    def get_free(self) -> Optional[Match]:
-        # Return first free match.
-        for idx, m in enumerate(self.matches):
-            if not m:
+    def get_free(self) -> Optional[int]:
+        """Return the first free slot id from `self`."""
+        for idx, m in enumerate(self):
+            if m is None:
                 return idx
 
-    def get_by_id(self, mid: int) -> Optional[Match]:
-        for m in self.matches:
-            if m and m.id == mid:
-                return m
-
-    async def add(self, m: Match) -> None:
-        if m in self.matches:
-            await plog(f'{m} already in matches list!')
-            return
+    def append(self, m: 'Match') -> bool:
+        if m in self:
+            breakpoint()
 
         if (free := self.get_free()) is not None:
+            # set the id of the match to the free slot.
             m.id = free
-            await plog(f'Adding {m} to matches list.')
-            self.matches[free] = m
-        else:
-            await plog(f'Match list is full! Could not add {m}.')
+            self[free] = m
 
-    async def remove(self, m: Match) -> None:
-        await plog(f'Removing {m} from matches list.')
-        for idx, i in enumerate(self.matches):
-            if m == i:
-                self.matches[idx] = None
+            if glob.config.debug:
+                log(f'{m} added to matches list.')
+
+            return True
+        else:
+            log(f'Match list is full! Could not add {m}.')
+            return False
+
+    def remove(self, m: 'Match') -> None:
+        for i, _m in enumerate(self):
+            if m is _m:
+                self[i] = None
                 break
 
-class PlayerList(Sequence):
-    """A class to represent all players online on the gulag.
+        if glob.config.debug:
+            log(f'{m} removed from matches list.')
 
-    Attributes
-    -----------
-    players: List[:class:`Player`]
-        A list of player objects representing the online users.
-    """
+class PlayerList:
+    """The currently active players on the server."""
     __slots__ = ('players',)
 
     def __init__(self):
         self.players = []
 
-    def __getitem__(self, index: Slice) -> Player:
+    def __getitem__(self, index: Union[int, slice]) -> Player:
         return self.players[index]
 
     def __contains__(self, p: Union[Player, str]) -> bool:
-        # Allow us to either pass in the player
+        # allow us to either pass in the player
         # obj, or the player name as a string.
         if isinstance(p, str):
-            return p in (player.name for player in self.players)
+            return p in [player.name for player in self.players]
         else:
             return p in self.players
 
@@ -143,98 +121,170 @@ class PlayerList(Sequence):
         return len(self.players)
 
     @property
-    def ids(self) -> Tuple[int, ...]:
+    def ids(self) -> tuple[int, ...]:
         return (p.id for p in self.players)
 
     @property
-    def staff(self) -> Set[Player]:
+    def staff(self) -> set[Player]:
         return {p for p in self.players if p.priv & Privileges.Staff}
 
-    def enqueue(self, data: bytes, immune: Tuple[Player, ...] = ()) -> None:
+    def enqueue(self, data: bytes, immune: tuple[Player, ...] = ()) -> None:
         for p in self.players:
             if p not in immune:
                 p.enqueue(data)
 
-    def get(self, token: str) -> Player:
+    async def get(self, sql: bool = False, **kwargs) -> Optional[Player]:
+        """Get a player by token, id, or name."""
+        for attr in ('token', 'id', 'name'):
+            if val := kwargs.pop(attr, None):
+                break
+        else:
+            raise ValueError('must provide valid kwarg (token, id, name) to get()')
+
+        if attr == 'name':
+            # name -> safe_name
+            attr = 'safe_name'
+            val = Player.make_safe(val)
+
         for p in self.players:
-            if p.token == token:
-                return p
-
-    async def get_by_name(self, name: str, sql: bool = False) -> Player:
-        for p in self.players:
-            if p.name == name:
-                return p
-
-        if not sql:
-            # Don't fetch from SQL
-            # if not specified.
-            return
-
-        # Try to get from SQL.
-        res = await glob.db.fetch(
-            'SELECT id, priv, silence_end '
-            'FROM users WHERE name = %s',
-            [name]
-        )
-
-        return Player(**res, name=name) if res else None
-
-    async def get_by_id(self, pid: int, sql: bool = False) -> Player:
-        for p in self.players:
-            if p.id == pid:
+            if getattr(p, attr) == val:
                 return p
 
         if not sql:
-            # Don't fetch from SQL
-            # if not specified.
+            # don't fetch from sql
+            # if not specified
             return
 
-        # Try to get from SQL.
+        # try to get from sql.
         res = await glob.db.fetch(
-            'SELECT name, priv, silence_end '
-            'FROM users WHERE id = %s',
-            [pid]
-        )
-
-        return Player(**res, id = pid) if res else None
-
-    async def get_login(self, name: str, phash: str) -> Optional[Player]:
-        # Only used cached results - the user should have
-        # logged into bancho at least once. (This does not
-        # mean they're logged in now).
-
-        # Let them pass as a string for ease of access
-        phash = phash.encode()
-
-        bcrypt_cache = glob.cache['bcrypt']
-
-        if phash not in bcrypt_cache:
-            # User has not logged in through bancho.
-            return
-
-        res = await glob.db.fetch(
-            'SELECT pw_hash FROM users WHERE name_safe = %s',
-            [Player.ensure_safe(name)]
+            'SELECT id, name, priv, pw_bcrypt, '
+            'silence_end, clan_id, clan_rank '
+            f'FROM users WHERE {attr} = %s',
+            [val]
         )
 
         if not res:
-            # Could not find user in the DB.
             return
 
-        if bcrypt_cache[phash] != res['pw_hash']:
-            # Password bcrypts do not match.
-            return
+        # overwrite some things with classes
+        res['priv'] = Privileges(res.pop('priv'))
 
-        return await self.get_by_name(name)
+        if res['clan_id'] != 0:
+            res['clan'] = glob.clans.get(id=res['clan_id'])
+            res['clan_rank'] = ClanRank(res['clan_rank'])
+        else:
+            res['clan'] = res['clan_rank'] = None
 
-    async def add(self, p: Player) -> None:
+        return Player(**res)
+
+    async def get_login(self, name: str, pw_md5: str, sql: bool = False) -> Optional[Player]:
+        # only used cached results - the user should have
+        # logged into bancho at least once. (This does not
+        # mean they're logged in now).
+
+        if not (p := await self.get(name=name, sql=sql)):
+            return # no such player online
+
+        if glob.cache['bcrypt'][p.pw_bcrypt] == pw_md5.encode():
+            return p
+
+    def append(self, p: Player) -> None:
+        """Attempt to add `p` to the list."""
         if p in self.players:
-            await plog(f'{p} already in players list!')
+            if glob.config.debug:
+                log(f'{p} double-added to global player list?')
             return
 
-        await plog(f'Adding {p} to players list.')
         self.players.append(p)
 
-    async def remove(self, p: Player) -> None:
-        await plog(f'Removing {p} from players list.')
+        if glob.config.debug:
+            log(f'{p} added to global player list.')
+
+    def remove(self, p: Player) -> None:
+        """Attempt to remove `p` from the list."""
         self.players.remove(p)
+
+        if glob.config.debug:
+            log(f'{p} removed from global player list.')
+
+class MapPoolList(list):
+    """The currently active mappools on the server."""
+
+    def __getitem__(self, index: Union[int, slice, str]) -> 'MapPool':
+        """Allow slicing by either a string (for name), or slice."""
+        if isinstance(index, str):
+            return self.get(index)
+        else:
+            return super().__getitem__(index)
+
+    def __contains__(self, o: Union['MapPool', str]) -> bool:
+        """Check whether internal list contains `o`."""
+        # Allow string to be passed to compare vs. name.
+        if isinstance(o, str):
+            return o in [p.name for p in self]
+        else:
+            return o in self
+
+    def get(self, name: str) -> Optional['MapPool']:
+        """Get a pool from the list by `name`."""
+        for p in self:
+            if p.name == name:
+                return p
+
+    def append(self, p: 'MapPool') -> None:
+        """Attempt to add `p` to the list."""
+        super().append(p)
+
+        if glob.config.debug:
+            log(f'{p} added to mappools list.')
+
+    def remove(self, p: 'MapPool') -> None:
+        """Attempt to remove `p` from the list."""
+        super().remove(p)
+
+        if glob.config.debug:
+            log(f'{p} removed from mappools list.')
+
+class ClanList(list):
+    """The currently active clans on the server."""
+
+    def __getitem__(self, index: Union[int, slice, str]) -> 'Clan':
+        """Allow slicing by either a string (for name), or slice."""
+        if isinstance(index, str):
+            return self.get(index)
+        else:
+            return super().__getitem__(index)
+
+    def __contains__(self, o: Union['Clan', str]) -> bool:
+        """Check whether internal list contains `o`."""
+        # Allow string to be passed to compare vs. name.
+        if isinstance(o, str):
+            return o in [c.name for c in self]
+        else:
+            return o in self
+
+    def get(self, **kwargs) -> Optional['Clan']:
+        """Get a clan by name, tag, or id."""
+        for attr in ('name', 'tag', 'id'):
+            if val := kwargs.pop(attr, None):
+                break
+        else:
+            raise ValueError('must provide valid kwarg (name, tag, id) to get()')
+
+        for c in self:
+            if getattr(c, attr) == val:
+                return c
+
+    def append(self, c: 'Clan') -> None:
+        """Attempt to add `c` to the list."""
+        super().append(c)
+
+        if glob.config.debug:
+            log(f'{c} added to clans list.')
+
+    def remove(self, c: 'Clan') -> None:
+        """Attempt to remove `c` from the list."""
+        super().remove(c)
+
+        if glob.config.debug:
+            log(f'{c} removed from clans list.')

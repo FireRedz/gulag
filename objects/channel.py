@@ -1,131 +1,101 @@
 # -*- coding: utf-8 -*-
 
-from typing import Tuple
+from typing import TYPE_CHECKING
 from constants.privileges import Privileges
 from objects import glob
 import packets
 
+if TYPE_CHECKING:
+    from objects.player import Player
+
 __all__ = 'Channel',
 
 class Channel:
-    """A class to represent a chat channel.
+    """An osu! chat channel.
 
-    Attributes
+    Possibly confusing attributes
     -----------
-    _name: :class:`str`
+    _name: `str`
         A name string of the channel.
         The cls.`name` property wraps handling for '#multiplayer' and
         '#spectator' when communicating with the osu! client; only use
         this attr when you need the channel's true name; otherwise you
         should use the `name` property described below.
 
-    topic: :class:`str`
-        The topic string of the channel.
-
-    players: List[:class:`Player`]
-        A list of player objects representing the players in the channel.
-        XXX: While channels store a list of player objs, players also
-             store a list of channel objs for channels they're in.
-
-    read: :class:`Privileges`
-        The privileges required to read messages in the channel.
-
-    write: :class:`Privileges`
-        The privileges required to write messages in the channel.
-
-    auto_join: :class:`bool`
-        A bool representing whether the channel should automatically
-        be joined on connection to the server.
-
-    instance: :class:`bool`
-        A bool representing whether the channel is an instance.
+    instance: `bool`
         Instanced channels are deleted when all players have left;
         this is useful for things like multiplayer, spectator, etc.
-
-    Properties
-    -----------
-    name: :class:`str`
-        A name string of the channel with #spec_x and #multi_x
-        replaced with the more readable '#spectator' and '#multiplayer'.
-
-    basic_info: Tuple[Union[:class:`str`, :class:`str`, :class:`int`]]
-        A tuple containing the channel's name
-        (clean output), topic, and playercount.
     """
     __slots__ = ('_name', 'topic', 'players',
-                 'read', 'write',
+                 'read_priv', 'write_priv',
                  'auto_join', 'instance')
 
-    def __init__(self, *args, **kwargs) -> None:
-        # Use this attribute whenever you need
-        # the 'real' name and not the wrapped one.
-        # (not replaced for #multiplayer/#spectator)
+    def __init__(self, name: str, topic: str,
+                 read_priv: Privileges = Privileges.Normal,
+                 write_priv: Privileges = Privileges.Normal,
+                 auto_join: bool = True,
+                 instance: bool = False,
+                 *args, **kwargs) -> None:
+        self._name = name # 'real' name ('#{multi/spec}_{id}')
+        self.topic = topic
+        self.read_priv = read_priv
+        self.write_priv = write_priv
+        self.auto_join = auto_join
+        self.instance = instance
 
-        # self.name should be used whenever
-        # interacting with the osu! client.
-        self._name = kwargs.get('name', None)
-        self.topic = kwargs.get('topic', None)
-        self.players = []
-
-        self.read = kwargs.get('read', Privileges.Normal)
-        self.write = kwargs.get('write', Privileges.Normal)
-        self.auto_join = kwargs.get('auto_join', True)
-        self.instance = kwargs.get('instance', False)
+        self.players: list['Player'] = []
 
     @property
     def name(self) -> str:
-        if self._name.startswith('#spec_'):
-            return '#spectator'
-        elif self._name.startswith('#multi_'):
-            return '#multiplayer'
-
-        return self._name
+        return ('#spectator' if self._name.startswith('#spec_')
+           else '#multiplayer' if self._name.startswith('#multi_')
+           else self._name)
 
     @property
-    def basic_info(self) -> Tuple[str, str, int]:
+    def basic_info(self) -> tuple[str, str, int]:
         return (self.name, self.topic, len(self.players))
 
     def __repr__(self) -> str:
         return f'<{self._name}>'
 
-    def __contains__(self, p) -> bool:
+    def __contains__(self, p: 'Player') -> bool:
         return p in self.players
 
-    async def send(self, client, msg: str) -> None:
-        self.enqueue(await packets.sendMessage(
-            client = client.name,
-            msg = msg,
-            target = self.name,
-            client_id = client.id
-        ), immune = {client.id})
-
-    async def send_selective(self, client, msg: str, targets) -> None:
-        # Accept a set of players to enqueue the data to.
-        for p in targets:
-            p.enqueue(await packets.sendMessage(
+    async def send(self, client: 'Player', msg: str,
+                   to_self: bool = False) -> None:
+        """Enqueue `client`'s `msg` to all connected clients."""
+        self.enqueue(
+            packets.sendMessage(
                 client = client.name,
                 msg = msg,
                 target = self.name,
                 client_id = client.id
-            ))
+            ),
+            immune = () if to_self else (client.id,)
+        )
 
-    def append(self, p) -> None:
+    async def send_selective(self, client: 'Player', msg: str,
+                             targets: list['Player']) -> None:
+        """Enqueue `client`'s `msg` to `targets`."""
+        for p in (t for t in targets if t in self):
+            await p.send(client, msg, chan=self)
+
+    def append(self, p: 'Player') -> None:
+        """Add `p` to the channel's players."""
         self.players.append(p)
 
-    async def remove(self, p) -> None:
-        if len(self.players) == 1 and self.instance:
-            # If it's an instance channel and this
+    async def remove(self, p: 'Player') -> None:
+        """Remove `p` from the channel's players."""
+        self.players.remove(p)
+
+        if len(self.players) == 0 and self.instance:
+            # if it's an instance channel and this
             # is the last member leaving, just remove
             # the channel from the global list.
-            await glob.channels.remove(self)
-        else:
-            self.players.remove(p)
+            glob.channels.remove(self)
 
-    def enqueue(self, data: bytes, immune: Tuple[int, ...] = ()) -> None:
-        # Enqueue bytes to all players in a channel.
-        # Usually just used for messages.. perhaps more?
+    def enqueue(self, data: bytes, immune: tuple[int, ...] = ()) -> None:
+        """Enqueue `data` to all connected clients not in `immune`."""
         for p in self.players:
-            if p.id in immune:
-                continue
-
-            p.enqueue(data)
+            if p.id not in immune:
+                p.enqueue(data)

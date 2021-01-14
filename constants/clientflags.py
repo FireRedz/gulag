@@ -1,37 +1,62 @@
 # -*- coding: utf-8 -*-
 
-from typing import Final
 from enum import IntFlag, unique
 
-__all__ = 'ClientFlags',
+__all__ = ('ClientFlags',)
 
 @unique
 class ClientFlags(IntFlag):
-    # osu! anticheat < 2016 (unsure of date?)
-    # NOTE: many of these flags are effectively useless
-    # and are even known to send false positives!
-    Clean:                       Final[int] = 0
-    SpeedHackDetected:           Final[int] = 1 << 1
-    IncorrectModValue:           Final[int] = 1 << 2 # completely useless flag, sends randomly
-    MultipleOsuClients:          Final[int] = 1 << 3
-    ChecksumFailure:             Final[int] = 1 << 4
-    FlashlightChecksumIncorrect: Final[int] = 1 << 5
-    OsuExecutableChecksum:       Final[int] = 1 << 6 # server-side
-    MissingProcessesInList:      Final[int] = 1 << 7 # server-side. also unused as of 2018
-    FlashLightImageHack:         Final[int] = 1 << 8
-    SpinnerHack:                 Final[int] = 1 << 9
-    TransparentWindow:           Final[int] = 1 << 10
-    FastPress:                   Final[int] = 1 << 11
-    RawMouseDiscrepancy:         Final[int] = 1 << 12
-    RawKeyboardDiscrepancy:      Final[int] = 1 << 13
+    # NOTE: many of these flags are quite outdated and/or
+    # broken and are even known to false positive quite often.
+    # they can be helpful; just take them with a grain of salt.
+
+    # osu! anticheat <= 2016 (unsure of age)
+    Clean                       = 0 # no flags sent
+
+    # flags for timing errors or desync.
+    SpeedHackDetected           = 1 << 1
+
+    # flags when two internal values mismatch.
+    # XXX: this false flags a lot so most code
+    # written around the community just ignores
+    # this bit; i'll investigate a bit i guess.
+    IncorrectModValue           = 1 << 2
+
+    MultipleOsuClients          = 1 << 3
+    ChecksumFailure             = 1 << 4
+    FlashlightChecksumIncorrect = 1 << 5
+
+    # these are only used on the osu!bancho official server.
+    OsuExecutableChecksum       = 1 << 6
+    MissingProcessesInList      = 1 << 7 # also deprecated as of 2018
+
+    # flags for either:
+    # 1. pixels that should be outside the visible radius
+    # (and thus black) being brighter than they should be.
+    # 2. from an internal alpha value being incorrect.
+    FlashLightImageHack         = 1 << 8
+
+    SpinnerHack                 = 1 << 9
+    TransparentWindow           = 1 << 10
+
+    # (mania) flags for consistently low press intervals.
+    FastPress                   = 1 << 11
+
+    # from my experience, pretty decent
+    # for detecting autobotted scores.
+    RawMouseDiscrepancy         = 1 << 12
+
+    RawKeyboardDiscrepancy      = 1 << 13
 
     # osu! anticheat 2019
-    RunWithLdFlag:   Final[int] = 1 << 14
-    ConsoleOpen:     Final[int] = 1 << 15
-    ExtraThreads:    Final[int] = 1 << 16
-    HQAssembly:      Final[int] = 1 << 17
-    HQFile:          Final[int] = 1 << 18
-    RegistryEdits:   Final[int] = 1 << 19
-    SQL2Library:     Final[int] = 1 << 20
-    libeay32Library: Final[int] = 1 << 21
-    aqnMenuSample:   Final[int] = 1 << 22
+    # XXX: the aqn flags were fixed within hours of the osu!
+    # update, and vanilla hq is not so widely used anymore.
+    RunWithLdFlag   = 1 << 14
+    ConsoleOpen     = 1 << 15
+    ExtraThreads    = 1 << 16
+    HQAssembly      = 1 << 17
+    HQFile          = 1 << 18
+    RegistryEdits   = 1 << 19
+    SQL2Library     = 1 << 20
+    libeay32Library = 1 << 21
+    aqnMenuSample   = 1 << 22

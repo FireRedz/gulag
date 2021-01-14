@@ -1,21 +1,32 @@
 # -*- coding: utf-8 -*-
 
-import asyncio
-from typing import Final, Optional
+from datetime import datetime
+from functools import partial
+from typing import TYPE_CHECKING, Any, Optional, Coroutine
+from dataclasses import dataclass
+from enum import IntEnum, unique
+from cmyui import log, Ansi
+import queue
 import time
 import uuid
+import random
 
-from constants.privileges import Privileges, BanchoPrivileges
-from constants.gamemodes import GameMode
+from constants.privileges import Privileges, ClientPrivileges
 from constants.countries import country_codes
-from console import plog, Ansi
+from constants.gamemodes import GameMode
+from constants.mods import Mods
 
 from objects.channel import Channel
-from objects.match import Match, SlotStatus
+from objects.match import Match, SlotStatus, MatchTeamTypes, MatchTeams
 from objects.beatmap import Beatmap
 from objects import glob
-from enum import IntEnum, unique
+
 import packets
+
+if TYPE_CHECKING:
+    from objects.score import Score
+    from objects.achievement import Achievement
+    from objects.clan import Clan, ClanRank
 
 __all__ = (
     'ModeData',
@@ -23,439 +34,453 @@ __all__ = (
     'Player'
 )
 
-class ModeData:
-    """A class to represent a player's stats in a single gamemode.
-
-    Attributes
-    -----------
-    tscore: :class:`int`
-        The player's total score.
-
-    rscore: :class:`int`
-        The player's ranked score.
-
-    pp: :class:`float`
-        The player's total performance points.
-
-    acc: :class:`float`
-        The player's overall accuracy.
-
-    plays: :class:`int`
-        The player's number of total plays.
-
-    playtime: :class:`int`
-        The player's total playtime (in seconds).
-
-    maxcombo: :class:`int`
-        The player's highest combo.
-
-    rank: :class:`int`
-        The player's global rank.
-    """
-    __slots__ = (
-        'tscore', 'rscore', 'pp', 'acc',
-        'plays', 'playtime', 'maxcombo', 'rank'
-    )
-
-    def __init__(self):
-        self.tscore = 0
-        self.rscore = 0
-        self.pp = 0
-        self.acc = 0.0
-        self.plays = 0
-        self.playtime = 0
-        self.maxcombo = 0
-        self.rank = 0
-
-    def update(self, **kwargs) -> None:
-        self.tscore = kwargs.get('tscore', 0)
-        self.rscore = kwargs.get('rscore', 0)
-        self.pp = kwargs.get('pp', 0)
-        self.acc = kwargs.get('acc', 0.0)
-        self.plays = kwargs.get('plays', 0)
-        self.playtime = kwargs.get('playtime', 0)
-        self.maxcombo = kwargs.get('maxcombo', 0)
-        self.rank = kwargs.get('rank', 0)
-
 @unique
 class PresenceFilter(IntEnum):
-    """A class to represent the update scope the client wishes to receive."""
-
-    Nil:     Final[int] = 0
-    All:     Final[int] = 1
-    Friends: Final[int] = 2
+    """osu! client side filter for which users the player can see."""
+    Nil     = 0
+    All     = 1
+    Friends = 2
 
 @unique
 class Action(IntEnum):
-    """A class to represent the client's current state."""
+    """The client's current state."""
+    Idle         = 0
+    Afk          = 1
+    Playing      = 2
+    Editing      = 3
+    Modding      = 4
+    Multiplayer  = 5
+    Watching     = 6
+    Unknown      = 7
+    Testing      = 8
+    Submitting   = 9
+    Paused       = 10
+    Lobby        = 11
+    Multiplaying = 12
+    OsuDirect    = 13
 
-    Idle:         Final[int] = 0
-    Afk:          Final[int] = 1
-    Playing:      Final[int] = 2
-    Editing:      Final[int] = 3
-    Modding:      Final[int] = 4
-    Multiplayer:  Final[int] = 5
-    Watching:     Final[int] = 6
-    Unknown:      Final[int] = 7
-    Testing:      Final[int] = 8
-    Submitting:   Final[int] = 9
-    Paused:       Final[int] = 10
-    Lobby:        Final[int] = 11
-    Multiplaying: Final[int] = 12
-    OsuDirect:    Final[int] = 13
+@dataclass
+class ModeData:
+    """A player's stats in a single gamemode."""
+    tscore: int
+    rscore: int
+    pp: int
+    acc: float
+    plays: int
+    playtime: int
+    max_combo: int
+    rank: int # global
 
+@dataclass
 class Status:
-    """A class to represent the current status of a player.
-
-    Attributes
-    -----------
-    action: :class:`Action`
-        The user's current set action.
-
-    info_text: :class:`str`
-        The text representing the user's action.
-
-    map_md5: :class:`str`
-        The md5 of the map the player is on.
-
-    mods: :class:`int`
-        The mods the player currently has enabled.
-
-    game_mode: :class:`int`
-        The current gamemode of the player.
-
-    map_id: :class:`int`
-        The id of the map the player is on.
-    """
-    __slots__ = (
-        'action', 'info_text', 'map_md5',
-        'mods', 'game_mode', 'map_id'
-    )
-
-    def __init__(self):
-        self.action = Action(0) # byte
-        self.info_text = '' # string
-        self.map_md5 = '' # string
-        self.mods = 0 # i32
-        self.game_mode = 0 # byte
-        self.map_id = 0 # i32
-
-    def update(self, action: int, info_text: str, map_md5: str,
-               mods: int, game_mode: int, map_id: int) -> None:
-        # osu! sends both map id and md5, but
-        # we'll only need one since we fetch a
-        # beatmap obj from cache/sql anyways..
-        self.action = Action(action)
-        self.info_text = info_text
-        self.map_md5 = map_md5
-        self.mods = mods
-        self.game_mode = game_mode
-        self.map_id = map_id
+    """The current status of a player."""
+    action: Action = Action.Idle
+    info_text: str = ''
+    map_md5: str = ''
+    mods: Mods = Mods.NOMOD
+    mode: GameMode = GameMode.vn_std
+    map_id: int = 0
 
 class Player:
-    """A class to represent a player.
+    """\
+    Server side representation of a player; not necessarily online.
 
-    Attributes
+    Possibly confusing attributes
     -----------
-    token: :class:`str`
+    token: `str`
         The player's unique token; used to
         communicate with the osu! client.
 
-    id: :class:`int`
-        The player's unique ID.
-
-    name: :class:`str`
-        The player's username (unsafe).
-
-    safe_name: :class:`str`
+    safe_name: `str`
         The player's username (safe).
         XXX: Equivalent to `cls.name.lower().replace(' ', '_')`.
 
-    priv: :class:`Privileges`
-        The player's privileges.
-
-    rx: :class:`bool`
-        Whether the player is using rx (used for gamemodes).
-
-    stats: List[:class:`ModeData`]
-        A list of `ModeData` objs representing
-        the player's stats for each gamemode.
-
-    status: :class:`Status`
-        A `Status` obj representing the player's current status.
-
-    friends: List[:class:`int`]
-        A list of player ids representing the player's friends.
-
-    channels: List[:class:`Channel`]
-        A list of `Channel` objs representing the channels the user is in.
-
-    spectators: List[:class:`Player`]
-        A list of `Player` objs representing the player's spectators.
-
-    spectating: Optional[:class:`Player`]
-        A `Player` obj representing the player this player is spectating.
-
-    match: Optional[:class:`Match`]
-        A `Match` obj representing the match the player is in.
-
-    recent_scores: List[Optional[:class:`Score`]]
-        A list of recent scores, one for each gamemode.
-
-    last_np: Optional[:class:`Beatmap`]
-        The last map /np'ed by the user, if there was one.
-
-    location: Tuple[:class:`float`, :class:`float`]
-        A tuple containing the latitude and longitude of the player.
-
-    country: Tuple[:class:`str`, :class:`int`]
-        A tuple containing the country code in letter and number forms.
-
-    utc_offset: :class:`int`
-        The player's UTC offset as an integer.
-
-    pm_private: :class:`bool`
+    pm_private: `bool`
         Whether the player is blocking pms from non-friends.
 
-    away_msg: Optional[:class:`str`]
-        A string representing the player's away message.
-
-    silence_end: :class:`int`
+    silence_end: `int`
         The UNIX timestamp the player's silence will end at.
 
-    in_lobby: :class:`bool`
-        Whether the player is currently in the multiplayer lobby.
-
-    login_time: :class:`int`
-        The UNIX timestamp of when the player logged in.
-
-    ping_time: :class:`int`
-        The UNIX timestamp of the last time the client pinged the server.
-
-    pres_filter: :class:`PresenceFilter`
+    pres_filter: `PresenceFilter`
         The scope of users the client can currently see.
 
-    _queue: :class:`SimpleQueue`
+    # XXX: below is mostly custom gulag,
+           or internal player class stuff.
+
+    menu_options: `dict[int, dict[str, Any]]`
+        The current osu! chat menu options available to the player.
+        XXX: These may eventually have a timeout.
+
+    _queue: `queue.SimpleQueue`
         A `SimpleQueue` obj representing our packet queue.
         XXX: cls.enqueue() will add data to this queue, and
              cls.dequeue() will return the data, and remove it.
-
-    Properties
-    -----------
-    url: :class:`str`
-        The user's url to their profile.
-
-    embed: :class:`str`
-        An osu! chat embed of a user's profile which displays their username.
-
-    silenced: :class:`bool`
-        Whether the user is currently silenced.
-
-    bancho_priv: :class:`BanchoPrivileges`
-        The user's privileges in the osu! client.
-
-    gm_stats: :class:`ModeData`
-        The user's stats for the current gamemode.
     """
     __slots__ = (
-        'token', 'id', 'name', 'safe_name', 'priv',
-        'rx', 'stats', 'status',
-        'friends', 'channels', 'spectators', 'spectating', 'match',
+        'token', 'id', 'name', 'safe_name', 'pw_bcrypt',
+        'priv', 'stats', 'status', 'friends', 'channels',
+        'spectators', 'spectating', 'match',
+        'clan', 'clan_rank', 'achievements',
         'recent_scores', 'last_np', 'country', 'location',
         'utc_offset', 'pm_private',
         'away_msg', 'silence_end', 'in_lobby',
-        'login_time', 'ping_time', 'pres_filter',
-        '_queue'
+        'login_time', 'last_recv_time', 'osu_ver',
+        'pres_filter', 'menu_options', '_queue'
     )
 
     def __init__(self, **kwargs) -> None:
-        self.token: str = kwargs.get('token', str(uuid.uuid4()))
-        self.id: Optional[int] = kwargs.get('id', None)
-        self.name: Optional[str] = kwargs.get('name', None)
-        self.safe_name: Optional[str] = self.ensure_safe(self.name) if self.name else None
-        self.priv = Privileges(kwargs.get('priv', Privileges.Normal))
+        self.id = kwargs.pop('id', 0)
+        self.name = kwargs.pop('name', '')
+        self.priv = kwargs.pop('priv', Privileges(0))
 
-        self.rx = False # stored for ez use
-        self.stats = [ModeData() for _ in range(7)]
+        self.token = kwargs.pop('token', '')
+        self.safe_name = self.make_safe(self.name) if self.name else ''
+        self.pw_bcrypt = kwargs.pop('pw_bcrypt', b'')
+
+        self.stats: dict[GameMode, ModeData] = {}
         self.status = Status()
 
-        self.friends = set() # userids, not player objects
-        self.channels = []
-        self.spectators = []
+        self.friends: set[int] = set() # userids, not player objects
+        self.channels: list[Channel] = []
+        self.spectators: list[Player] = []
         self.spectating: Optional[Player] = None
         self.match: Optional[Match] = None
 
-        # Store most recent score for each gamemode.
-        self.recent_scores = [None for _ in range(7)]
+        self.clan: Optional['Clan'] = kwargs.get('clan', None)
+        self.clan_rank: Optional['ClanRank'] = kwargs.get('clan_rank', None)
 
-        # Store the last beatmap /np'ed by the user.
-        self.last_np: Optional[Beatmap] = None
+        # store achievements per-gamemode
+        self.achievements: dict[int, set['Achievement']] = {
+            0: set(), 1: set(),
+            2: set(), 3: set()
+        }
 
-        self.country = (0, 'XX') # (code , letters)
+        self.country = (0, 'XX') # (code, letters)
         self.location = (0.0, 0.0) # (lat, long)
 
-        self.utc_offset: int = kwargs.get('utc_offset', 0)
-        self.pm_private: bool = kwargs.get('pm_private', False)
+        self.utc_offset = kwargs.pop('utc_offset', 0)
+        self.pm_private = kwargs.pop('pm_private', False)
 
         self.away_msg: Optional[str] = None
-        self.silence_end: int = kwargs.get('silence_end', 0)
+        self.silence_end = kwargs.pop('silence_end', 0)
         self.in_lobby = False
 
-        c_time = int(time.time())
-        self.login_time = c_time
-        self.ping_time = c_time
-        del c_time
+        self.login_time = 0.0
+        self.last_recv_time = 0.0
 
+        self.osu_ver: Optional[datetime] = kwargs.pop('osu_ver', None)
         self.pres_filter = PresenceFilter.Nil
 
-        # Packet queue
-        self._queue = asyncio.Queue()
+        # XXX: below is mostly gulag-specific & internal stuff
+
+        # store most recent score for each gamemode.
+        self.recent_scores: dict[GameMode, Score] = {}
+
+        # store the last beatmap /np'ed by the user.
+        self.last_np: Optional[Beatmap] = None
+
+        # {id: {'callback', func, 'timeout': unixt, 'reusable': False}, ...}
+        self.menu_options: dict[int, dict[str, Any]] = {}
+
+        # packet queue
+        self._queue = queue.SimpleQueue()
+
+    def __repr__(self) -> str:
+        return f'<{self.name} ({self.id})>'
+
+    @property
+    def online(self) -> bool:
+        return self.token != ''
 
     @property
     def url(self) -> str:
-        return f'https://akatsuki.pw/u/{self.id}'
+        """The url to the player's profile."""
+        return f'https://{glob.config.domain}/u/{self.id}'
 
     @property
     def embed(self) -> str:
+        """An osu! chat embed to the player's profile."""
         return f'[{self.url} {self.name}]'
 
     @property
+    def full_name(self) -> str:
+        """The user's "full" name; including their clan tag."""
+        if self.clan:
+            return f'[{self.clan.tag}] {self.name}'
+        else:
+            return self.name
+
+    @property
+    def remaining_silence(self) -> int:
+        """The remaining time of the players silence."""
+        return max(0, int(self.silence_end - time.time()))
+
+    @property
     def silenced(self) -> bool:
-        return time.time() <= self.silence_end
+        """Whether or not the player is silenced."""
+        return self.remaining_silence != 0
 
     @property
     def bancho_priv(self) -> int:
-        ret = BanchoPrivileges(0)
+        """The player's privileges according to the client."""
+        ret = ClientPrivileges(0)
         if self.priv & Privileges.Normal:
-            # All players have ingame "supporter".
-            # This enables stuff like osu!direct,
+            # all players have in-game "supporter".
+            # this enables stuff like osu!direct,
             # multiplayer in cutting edge, etc.
-            ret |= (BanchoPrivileges.Player | BanchoPrivileges.Supporter)
+            ret |= (ClientPrivileges.Player | ClientPrivileges.Supporter)
         if self.priv & Privileges.Mod:
-            ret |= BanchoPrivileges.Moderator
+            ret |= ClientPrivileges.Moderator
         if self.priv & Privileges.Admin:
-            ret |= BanchoPrivileges.Developer
+            ret |= ClientPrivileges.Developer
         if self.priv & Privileges.Dangerous:
-            ret |= BanchoPrivileges.Owner
+            ret |= ClientPrivileges.Owner
         return ret
 
     @property
     def gm_stats(self) -> ModeData:
-        # Mania is the same mode on both vn and rx.
-        if self.status.game_mode == 3:
-            return self.stats[3]
+        """The player's stats in their currently selected mode."""
+        return self.stats[self.status.mode]
 
-        return self.stats[self.status.game_mode + (4 if self.rx else 0)]
+    @property
+    def recent_score(self) -> 'Score':
+        """The player's most recently submitted score."""
+        score = None
+        for s in self.recent_scores.values():
+            if not s:
+                continue
 
-    def __repr__(self) -> str:
-        return f'<id: {self.id} | name: {self.name}>'
+            if not score:
+                score = s
+                continue
+
+            if s.play_time > score.play_time:
+                score = s
+
+        return score
 
     @staticmethod
-    def ensure_safe(name: str) -> str:
+    def generate_token() -> str:
+        """Generate a random uuid as a token."""
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def make_safe(name: str) -> str:
+        """Return a name safe for usage in sql."""
         return name.lower().replace(' ', '_')
 
+    @classmethod
+    def login(cls, user_info, utc_offset: int,
+              pm_private: bool, osu_ver: datetime,
+              login_time: float, clan: 'Clan',
+              clan_rank: 'ClanRank'):
+        """Log a player into the server, with all info required."""
+        # user_info: {id, name, priv, pw_bcrypt, silence_end}
+        token = cls.generate_token()
+        priv = Privileges(user_info.pop('priv'))
+        p = cls(**user_info, pm_private=pm_private,
+                priv=priv, utc_offset=utc_offset,
+                token=token, osu_ver=osu_ver,
+                clan=clan, clan_rank=clan_rank
+        )
+
+        for mode in GameMode: # start empty
+            p.recent_scores[mode] = None
+            p.stats[mode] = None
+
+        p.login_time = p.last_recv_time = login_time
+        return p
+
     async def logout(self) -> None:
-        # Invalidate the user's token.
+        """Log `self` out of the server."""
+
+        # invalidate the user's token.
         self.token = ''
 
-        # Leave multiplayer.
+        # leave multiplayer.
         if self.match:
             await self.leave_match()
 
-        # Stop spectating.
+        # stop spectating.
         if h := self.spectating:
             await h.remove_spectator(self)
 
-        # Leave channels
+        # leave channels
         while self.channels:
             await self.leave_channel(self.channels[0])
 
-        # Remove from playerlist and
+        # remove from playerlist and
         # enqueue logout to all users.
-        await glob.players.remove(self)
-        glob.players.enqueue(await packets.logout(self.id))
+        glob.players.remove(self)
+        glob.players.enqueue(packets.logout(self.id))
 
-    async def restrict(self) -> None: # TODO: reason
-        self.priv &= ~Privileges.Normal
+    async def update_privs(self, new: Privileges) -> None:
+        """Update `self`'s privileges to `new`."""
+        self.priv = new
+
         await glob.db.execute(
-            'UPDATE users SET priv = %s WHERE id = %s',
+            'UPDATE users '
+            'SET priv = %s '
+            'WHERE id = %s',
             [int(self.priv), self.id]
         )
 
+    async def add_privs(self, bits: Privileges) -> None:
+        """Update `self`'s privileges, adding `bits`."""
+        self.priv |= bits
+
+        await glob.db.execute(
+            'UPDATE users '
+            'SET priv = %s '
+            'WHERE id = %s',
+            [int(self.priv), self.id]
+        )
+
+    async def remove_privs(self, bits: Privileges) -> None:
+        """Update `self`'s privileges, removing `bits`."""
+        self.priv &= ~bits
+
+        await glob.db.execute(
+            'UPDATE users '
+            'SET priv = %s '
+            'WHERE id = %s',
+            [int(self.priv), self.id]
+        )
+
+    async def ban(self, admin: 'Player', reason: str) -> None:
+        """Ban `self` for `reason`, and log to sql."""
+        await self.remove_privs(Privileges.Normal)
+
+        log_msg = f'{admin} banned for "{reason}".'
+        await glob.db.execute(
+            'INSERT INTO logs (`from`, `to`, `msg`, `time`) '
+            'VALUES (%s, %s, %s, NOW())',
+            [admin.id, self.id, log_msg]
+        )
+
         if self in glob.players:
-            # If user is online, notify and log them out.
-            # XXX: If you want to lock the player's
+            # if user is online, notify and log them out.
+            # XXX: if you want to lock the player's
             # client, you can send -3 rather than -1.
-            self.enqueue(await packets.userID(-1))
-            self.enqueue(await packets.notification(
+            self.enqueue(packets.userID(-1))
+            self.enqueue(packets.notification(
                 'Your account has been banned.\n\n'
                 'If you believe this was a mistake or '
                 'have waited >= 2 months, you can appeal '
                 'using the appeal form on the website.'
             ))
 
-        await plog(f'Restricted {self}.', Ansi.CYAN)
+        log(f'Banned {self}.', Ansi.CYAN)
 
-    async def unrestrict(self) -> None:
-        self.priv &= Privileges.Normal
+    async def unban(self, admin: 'Player', reason: str) -> None:
+        """Unban `self` for `reason`, and log to sql."""
+        await self.add_privs(Privileges.Normal)
+
+        log_msg = f'{admin} unbanned for "{reason}".'
         await glob.db.execute(
-            'UPDATE users SET priv = %s WHERE id = %s',
-            [int(self.priv), self.id]
+            'INSERT INTO logs (`from`, `to`, `msg`, `time`) '
+            'VALUES (%s, %s, %s, NOW())',
+            [admin.id, self.id, log_msg]
         )
 
-        await plog(f'Unrestricted {self}.', Ansi.CYAN)
+        log(f'Unbanned {self}.', Ansi.CYAN)
+
+    async def silence(self, admin: 'Player', duration: int,
+                      reason: str) -> None:
+        """Silence `self` for `duration` seconds, and log to sql."""
+        self.silence_end = int(time.time() + duration)
+
+        await glob.db.execute(
+            'UPDATE users SET silence_end = %s WHERE id = %s',
+            [self.silence_end, self.id]
+        )
+
+        log_msg = f'{admin} silenced ({duration}s) for "{reason}".'
+        await glob.db.execute(
+            'INSERT INTO logs (`from`, `to`, `msg`, `time`) '
+            'VALUES (%s, %s, %s, NOW())',
+            [admin.id, self.id, log_msg]
+        )
+
+        # inform the user's client
+        self.enqueue(packets.silenceEnd(duration))
+
+        # wipe their messages from any channels.
+        glob.players.enqueue(packets.userSilenced(self.id))
+
+        log(f'Silenced {self}.', Ansi.CYAN)
+
+    async def unsilence(self, admin: 'Player') -> None:
+        """Unsilence `self`, and log to sql."""
+        self.silence_end = int(time.time())
+
+        await glob.db.execute(
+            'UPDATE users SET silence_end = %s WHERE id = %s',
+            [self.silence_end, self.id]
+        )
+
+        log_msg = f'{admin} unsilenced.'
+        await glob.db.execute(
+            'INSERT INTO logs (`from`, `to`, `msg`, `time`) '
+            'VALUES (%s, %s, %s, NOW())',
+            [admin.id, self.id, log_msg]
+        )
+
+        # inform the user's client
+        self.enqueue(packets.silenceEnd(0))
+
+        log(f'Unsilenced {self}.', Ansi.CYAN)
 
     async def join_match(self, m: Match, passwd: str) -> bool:
+        """Attempt to add `self` to `m`."""
         if self.match:
-            await plog(f'{self} tried to join multiple matches?')
-            self.enqueue(await packets.matchJoinFail(m))
+            log(f'{self} tried to join multiple matches?')
+            self.enqueue(packets.matchJoinFail())
             return False
 
-        if m.chat: # Match already exists, we're simply joining.
-            if passwd != m.passwd: # eff: could add to if? or self.create_m..
-                await plog(f'{self} tried to join {m} with incorrect passwd.')
-                self.enqueue(await packets.matchJoinFail(m))
+        if self is not m.host:
+            # match already exists, we're simply joining.
+            if self not in glob.players.staff and passwd != m.passwd:
+                log(f'{self} tried to join {m} with incorrect passwd.')
+                self.enqueue(packets.matchJoinFail())
                 return False
             if (slotID := m.get_free()) is None:
-                await plog(f'{self} tried to join a full match.')
-                self.enqueue(await packets.matchJoinFail(m))
+                log(f'{self} tried to join a full match.')
+                self.enqueue(packets.matchJoinFail())
                 return False
+
         else:
-            # Match is being created
+            # match is being created
             slotID = 0
-            await glob.matches.add(m) # add to global matchlist
-                                      # This will generate an ID.
-
-            await glob.channels.add(Channel(
-                name = f'#multi_{m.id}',
-                topic = f"MID {m.id}'s multiplayer channel.",
-                read = Privileges.Normal,
-                write = Privileges.Normal,
-                auto_join = False,
-                instance = True))
-
-            m.chat = glob.channels.get(f'#multi_{m.id}')
 
         if not await self.join_channel(m.chat):
-            await plog(f'{self} failed to join {m.chat}.')
+            log(f'{self} failed to join {m.chat}.')
             return False
 
-        if (lobby := glob.channels.get('#lobby')) in self.channels:
+        if (lobby := glob.channels['#lobby']) in self.channels:
             await self.leave_channel(lobby)
 
         slot = m.slots[0 if slotID == -1 else slotID]
 
+        # if in a teams-vs mode, switch team from neutral to red.
+        if m.team_type in (MatchTeamTypes.team_vs,
+                           MatchTeamTypes.tag_team_vs):
+            slot.team = MatchTeams.red
+
         slot.status = SlotStatus.not_ready
         slot.player = self
         self.match = m
-        self.enqueue(await packets.matchJoinSuccess(m))
-        m.enqueue(await packets.updateMatch(m))
+
+        self.enqueue(packets.matchJoinSuccess(m))
+        m.enqueue_state()
 
         return True
 
     async def leave_match(self) -> None:
+        """Attempt to remove `self` from their match."""
         if not self.match:
-            await plog(f'{self} tried leaving a match but is not in one?')
+            if glob.config.debug:
+                log(f"{self} tried leaving a match they're not in?")
             return
 
         for s in self.match.slots:
@@ -465,261 +490,389 @@ class Player:
 
         await self.leave_channel(self.match.chat)
 
-        if all(s.empty() for s in self.match.slots):
-            # Multi is now empty, chat has been removed.
-            # Remove the multi from the channels list.
-            await plog(f'Match {self.match} finished.')
-            await glob.matches.remove(self.match)
+        if all(map(lambda s: s.empty(), self.match.slots)):
+            # multi is now empty, chat has been removed.
+            # remove the multi from the channels list.
+            log(f'Match {self.match} finished.')
+            glob.matches.remove(self.match)
 
-            if lobby := glob.channels.get('#lobby'):
-                lobby.enqueue(await packets.disposeMatch(self.match.id))
-        else: # Notify others of our deprature
-            self.match.enqueue(await packets.updateMatch(self.match))
+            if lobby := glob.channels['#lobby']:
+                lobby.enqueue(packets.disposeMatch(self.match.id))
+
+        else:
+            # we may have been host, if so, find another.
+            if self is self.match.host:
+                for s in self.match.slots:
+                    if s.status & SlotStatus.has_player:
+                        self.match.host = s.player
+                        self.match.host.enqueue(packets.matchTransferHost())
+                        break
+
+            # notify others of our deprature
+            self.match.enqueue_state()
 
         self.match = None
 
     async def join_channel(self, c: Channel) -> bool:
+        """Attempt to add `self` to `c`."""
         if self in c:
-            # User already in the channel.
-            await plog(f'{self} tried to double join {c}.')
+            # user already in the channel.
+            if glob.config.debug:
+                log(f'{self} was double-added to {c}.')
+
             return False
 
-        if not self.priv & c.read:
-            await plog(f'{self} tried to join {c} but lacks privs.')
+        if not self.priv & c.read_priv:
+            log(f'{self} tried to join {c} but lacks privs.')
             return False
 
-        # Lobby can only be interacted with while in mp lobby.
+        # lobby can only be interacted with while in mp lobby.
         if c._name == '#lobby' and not self.in_lobby:
             return False
 
         c.append(self) # Add to channels
         self.channels.append(c) # Add to player
 
-        self.enqueue(await packets.channelJoin(c.name))
+        self.enqueue(packets.channelJoin(c.name))
 
-        # Update channel usercounts for all clients that can see.
-        # For instanced channels, enqueue update to only players
+        # update channel usercounts for all clients that can see.
+        # for instanced channels, enqueue update to only players
         # in the instance; for normal channels, enqueue to all.
         targets = c.players if c.instance else glob.players
 
         for p in targets:
-            p.enqueue(await packets.channelInfo(*c.basic_info))
+            p.enqueue(packets.channelInfo(*c.basic_info))
 
-        await plog(f'{self} joined {c}.')
+        if glob.config.debug:
+            log(f'{self} joined {c}.')
+
         return True
 
     async def leave_channel(self, c: Channel) -> None:
+        """Attempt to remove `self` from `c`."""
         if self not in c:
-            await plog(f'{self} tried to leave {c} but is not in it.')
+            log(f'{self} tried to leave {c} but is not in it.')
             return
 
-        await c.remove(self) # Remove from channels
-        self.channels.remove(c) # Remove from player
+        await c.remove(self) # remove from channels
+        self.channels.remove(c) # remove from player
 
-        self.enqueue(await packets.channelKick(c.name))
+        self.enqueue(packets.channelKick(c.name))
 
-        # Update channel usercounts for all clients that can see.
-        # For instanced channels, enqueue update to only players
+        # update channel usercounts for all clients that can see.
+        # for instanced channels, enqueue update to only players
         # in the instance; for normal channels, enqueue to all.
         targets = c.players if c.instance else glob.players
 
         for p in targets:
-            p.enqueue(await packets.channelInfo(*c.basic_info))
+            p.enqueue(packets.channelInfo(*c.basic_info))
 
-        await plog(f'{self} left {c}.')
+        if glob.config.debug:
+            log(f'{self} left {c}.')
 
-    async def add_spectator(self, p) -> None:
+    async def add_spectator(self, p: 'Player') -> None:
+        """Attempt to add `p` to `self`'s spectators."""
         chan_name = f'#spec_{self.id}'
-        if not (c := glob.channels.get(chan_name)):
-            # Spec channel does not exist, create it and join.
-            await glob.channels.add(Channel(
+
+        if not (spec_chan := glob.channels[chan_name]):
+            # spectator chan doesn't exist, create it.
+            spec_chan = Channel(
                 name = chan_name,
                 topic = f"{self.name}'s spectator channel.'",
                 read = Privileges.Normal,
                 write = Privileges.Normal,
                 auto_join = False,
-                instance = True)
+                instance = True
             )
 
-            c = glob.channels.get(chan_name)
+            await self.join_channel(spec_chan)
+            glob.channels.append(spec_chan)
 
-        if not await p.join_channel(c):
-            return await plog(f'{self} failed to join {c}?')
+        # attempt to join their spectator channel.
+        if not await p.join_channel(spec_chan):
+            return log(f'{self} failed to join {spec_chan}?')
 
-        #p.enqueue(await packets.channelJoin(c.name))
-        p_joined = await packets.fellowSpectatorJoined(p.id)
+        #p.enqueue(packets.channelJoin(c.name))
+        p_joined = packets.fellowSpectatorJoined(p.id)
 
         for s in self.spectators:
             s.enqueue(p_joined)
-            p.enqueue(await packets.fellowSpectatorJoined(s.id))
+            p.enqueue(packets.fellowSpectatorJoined(s.id))
 
         self.spectators.append(p)
         p.spectating = self
 
-        self.enqueue(await packets.spectatorJoined(p.id))
-        await plog(f'{p} is now spectating {self}.')
+        self.enqueue(packets.spectatorJoined(p.id))
+        log(f'{p} is now spectating {self}.')
 
-    async def remove_spectator(self, p) -> None:
+    async def remove_spectator(self, p: 'Player') -> None:
+        """Attempt to remove `p` from `self`'s spectators."""
         self.spectators.remove(p)
         p.spectating = None
 
-        c = glob.channels.get(f'#spec_{self.id}')
+        c = glob.channels[f'#spec_{self.id}']
         await p.leave_channel(c)
 
         if not self.spectators:
-            # Remove host from channel, deleting it.
+            # remove host from channel, deleting it.
             await self.leave_channel(c)
         else:
-            fellow = await packets.fellowSpectatorLeft(p.id)
-            c_info = await packets.channelInfo(*c.basic_info) # new playercount
+            fellow = packets.fellowSpectatorLeft(p.id)
+            c_info = packets.channelInfo(*c.basic_info) # new playercount
 
             self.enqueue(c_info)
 
             for s in self.spectators:
                 s.enqueue(fellow + c_info)
 
-        self.enqueue(await packets.spectatorLeft(p.id))
-        await plog(f'{p} is no longer spectating {self}.')
+        self.enqueue(packets.spectatorLeft(p.id))
+        log(f'{p} is no longer spectating {self}.')
 
-    async def add_friend(self, p) -> None:
+    async def add_friend(self, p: 'Player') -> None:
+        """Attempt to add `p` to `self`'s friends."""
         if p.id in self.friends:
-            await plog(f'{self} tried to add {p}, who is already their friend!')
+            log(f'{self} tried to add {p}, who is already their friend!')
             return
 
         self.friends.add(p.id)
         await glob.db.execute(
             'INSERT INTO friendships '
             'VALUES (%s, %s)',
-            [self.id, p.id])
+            [self.id, p.id]
+        )
 
-        await plog(f'{self} added {p} to their friends.')
+        log(f'{self} added {p} to their friends.')
 
-    async def remove_friend(self, p) -> None:
+    async def remove_friend(self, p: 'Player') -> None:
+        """Attempt to remove `p` from `self`'s friends."""
         if not p.id in self.friends:
-            await plog(f'{self} tried to remove {p}, who is not their friend!')
+            log(f'{self} tried to remove {p}, who is not their friend!')
             return
 
         self.friends.remove(p.id)
         await glob.db.execute(
             'DELETE FROM friendships '
             'WHERE user1 = %s AND user2 = %s',
-            [self.id, p.id])
+            [self.id, p.id]
+        )
 
-        await plog(f'{self} removed {p} from their friends.')
-
-    def queue_empty(self) -> bool:
-        return self._queue.empty()
-
-    def enqueue(self, b: bytes) -> None:
-        self._queue.put_nowait(b)
-
-    async def dequeue(self) -> Optional[bytes]:
-        try:
-            return self._queue.get_nowait()
-        except:
-            await plog('Empty queue?')
+        log(f'{self} removed {p} from their friends.')
 
     async def fetch_geoloc(self, ip: str) -> None:
-        async with glob.http.get(f'http://ip-api.com/json/{ip}') as resp:
+        """Fetch a player's geolocation data based on their ip."""
+        url = f'http://ip-api.com/json/{ip}'
+
+        async with glob.http.get(url) as resp:
             if not resp or resp.status != 200:
-                await plog('Failed to get geoloc data: request failed.', Ansi.LIGHT_RED)
+                log('Failed to get geoloc data: request failed.', Ansi.LRED)
                 return
 
             res = await resp.json()
 
         if 'status' not in res or res['status'] != 'success':
-            await plog(f"Failed to get geoloc data: {res['message']}.", Ansi.LIGHT_RED)
+            log(f"Failed to get geoloc data: {res['message']}.", Ansi.LRED)
             return
 
         country = res['countryCode']
 
+        # store their country as a 2-letter code, and as a number.
+        # the players location is stored for the ingame world map.
         self.country = (country_codes[country], country)
         self.location = (res['lon'], res['lat'])
 
-    async def update_stats(self, gm: GameMode = GameMode.vn_std) -> None:
-        table = 'scores_rx' if gm >= 4 else 'scores_vn'
+    async def unlock_achievement(self, ach: 'Achievement') -> None:
+        """Unlock `ach` for `self`, storing in both cache & sql."""
+        await glob.db.execute(
+            'INSERT INTO user_achievements '
+            '(userid, achid) VALUES (%s, %s)',
+            [self.id, ach.id]
+        )
+
+        self.achievements[ach.mode].add(ach)
+
+    async def update_stats(self, mode: GameMode = GameMode.vn_std) -> None:
+        """Update a player's stats in-game and in sql."""
+        table = mode.sql_table
 
         res = await glob.db.fetchall(
             f'SELECT s.pp, s.acc FROM {table} s '
             'LEFT JOIN maps m ON s.map_md5 = m.md5 '
-            'WHERE s.userid = %s AND s.game_mode = %s '
+            'WHERE s.userid = %s AND s.mode = %s '
             'AND s.status = 2 AND m.status IN (1, 2) '
-            'ORDER BY s.pp DESC LIMIT 100', [
-                self.id, gm % 4
-            ]
+            'ORDER BY s.pp DESC LIMIT 100',
+            [self.id, mode.as_vanilla]
         )
 
         if not res:
             return # ?
 
-        # Update the user's stats ingame, then update db.
-        self.stats[gm].plays += 1
-        self.stats[gm].pp = sum(round(round(row['pp']) * 0.95 ** i)
-                                for i, row in enumerate(res))
-        self.stats[gm].acc = sum([row['acc'] for row in res][:50]) / min(50, len(res)) / 100.0
+        stats = self.stats[mode]
 
+        # increment playcount
+        stats.plays += 1
+
+        # calculate avg acc based on top 50 scores
+        stats.acc = sum([row['acc'] for row in res[:50]]) / min(50, len(res))
+
+        # calculate weighted pp based on top 100 scores
+        stats.pp = round(sum(row['pp'] * 0.95 ** i for i, row in enumerate(res)))
+
+        # keep stats up to date in sql
         await glob.db.execute(
             'UPDATE stats SET pp_{0:sql} = %s, '
             'plays_{0:sql} = plays_{0:sql} + 1, '
-            'acc_{0:sql} = %s WHERE id = %s'.format(gm), [
-                self.stats[gm].pp,
-                self.stats[gm].acc,
-                self.id
-            ]
+            'acc_{0:sql} = %s WHERE id = %s'.format(mode),
+            [stats.pp, stats.acc, self.id]
         )
 
-        # Calculate rank.
+        # calculate rank.
         res = await glob.db.fetch(
             'SELECT COUNT(*) AS c FROM stats '
             'LEFT JOIN users USING(id) '
-            f'WHERE pp_{gm:sql} > %s '
-            'AND priv & 1', [
-                self.stats[gm].pp
-            ])
+            f'WHERE pp_{mode:sql} > %s '
+            'AND priv & 1',
+            [stats.pp]
+        )
 
-        self.stats[gm].rank = res['c'] + 1
-        self.enqueue(await packets.userStats(self))
-        await plog(f"Updated {self}'s {gm!r} stats.")
+        stats.rank = res['c'] + 1
+        self.enqueue(packets.userStats(self))
 
     async def friends_from_sql(self) -> None:
-        self.friends = {row['user2'] async for row in glob.db.iterall(
+        """Retrieve `self`'s friends from sql."""
+        _friends = {row['user2'] async for row in glob.db.iterall(
             'SELECT user2 FROM friendships WHERE user1 = %s', [self.id]
-        )} | {1, self.id} # Always have bot & self added.
+        )}
+
+        # always have self & bot added to friends.
+        self.friends = _friends | {1, self.id}
+
+    async def achievements_from_sql(self) -> None:
+        """Retrieve `self`'s achievements from sql."""
+        for mode in range(4):
+            # get all users achievements for this mode
+            res = await glob.db.fetchall(
+                'SELECT ua.achid id FROM user_achievements ua '
+                'LEFT JOIN achievements a ON a.id = ua.achid '
+                'WHERE ua.userid = %s AND a.mode = %s',
+                [self.id, mode]
+            )
+
+            if not res:
+                # user has no achievements for this mode.
+                continue
+
+            # get cached achievements for this mode
+            achs = glob.achievements[mode]
+
+            for row in res:
+                for ach in achs:
+                    if row['id'] == ach.id:
+                        self.achievements[mode].add(ach)
 
     async def stats_from_sql_full(self) -> None:
-        for gm in GameMode:
-            # Grab static stats from SQL.
-            if not (res := await glob.db.fetch(
+        """Retrieve `self`'s stats (all modes) from sql."""
+        for mode in GameMode:
+            # grab static stats from SQL.
+            res = await glob.db.fetch(
                 'SELECT tscore_{0:sql} tscore, rscore_{0:sql} rscore, '
                 'pp_{0:sql} pp, plays_{0:sql} plays, acc_{0:sql} acc, '
-                'playtime_{0:sql} playtime, maxcombo_{0:sql} maxcombo '
-                'FROM stats WHERE id = %s'.format(gm), [self.id])
-            ): raise Exception(f"Failed to fetch {self}'s {gm!r} user stats.")
+                'playtime_{0:sql} playtime, maxcombo_{0:sql} max_combo '
+                'FROM stats WHERE id = %s'.format(mode),
+                [self.id]
+            )
 
-            # Calculate rank.
+            if not res:
+                log(f"Failed to fetch {self}'s {mode!r} stats.", Ansi.LRED)
+                return
+
+            # calculate rank.
             res['rank'] = (await glob.db.fetch(
                 'SELECT COUNT(*) AS c FROM stats '
                 'LEFT JOIN users USING(id) '
-                f'WHERE pp_{gm:sql} > %s '
+                f'WHERE pp_{mode:sql} > %s '
                 'AND priv & 1', [res['pp']]
             ))['c'] + 1
 
-            self.stats[gm].update(**res)
+            # update stats
+            self.stats[mode] = ModeData(**res)
 
-    async def stats_from_sql(self: int, gm: GameMode) -> None:
-        if not (res := await glob.db.fetch(
+    async def stats_from_sql(self, mode: GameMode) -> None:
+        """Retrieve `self`'s `mode` stats from sql."""
+        res = await glob.db.fetch(
             'SELECT tscore_{0:sql} tscore, rscore_{0:sql} rscore, '
             'pp_{0:sql} pp, plays_{0:sql} plays, acc_{0:sql} acc, '
-            'playtime_{0:sql} playtime, maxcombo_{0:sql} maxcombo '
-            'FROM stats WHERE id = %s'.format(gm), [self.id])
-        ): raise Exception(f"Failed to fetch {self}'s {gm!r} user stats.")
+            'playtime_{0:sql} playtime, maxcombo_{0:sql} max_combo '
+            'FROM stats WHERE id = %s'.format(mode),
+            [self.id]
+        )
 
-        # Calculate rank.
+        if not res:
+            log(f"Failed to fetch {self}'s {mode!r} stats.", Ansi.LRED)
+            return
+
+        # calculate rank.
         res['rank'] = await glob.db.fetch(
             'SELECT COUNT(*) AS c FROM stats '
             'LEFT JOIN users USING(id) '
-            f'WHERE pp_{gm:sql} > %s '
-            'AND priv & 1', [res['pp']]
+            f'WHERE pp_{mode:sql} > %s '
+            'AND priv & 1',
+            [res['pp']]
         )['c']
 
-        self.stats[gm].update(**res)
+        self.stats[mode] = ModeData(**res)
+
+    async def add_to_menu(self, coroutine: Coroutine,
+                          timeout: int = -1, reusable: bool = False
+                         ) -> int:
+        """Add a valid callback to the user's osu! chat options."""
+        # generate random negative number in int32 space as the key.
+        rand = partial(random.randint, -0x80000000, 0)
+        while (randnum := rand()) in self.menu_options:
+            ...
+
+        # append the callback to their menu options w/ args.
+        self.menu_options |= {
+            randnum: {
+                'callback': coroutine,
+                'reusable': reusable,
+                'timeout': timeout if timeout != -1 else 0x7fffffff
+            }
+        }
+
+        # return the key.
+        return randnum
+
+    async def update_latest_activity(self) -> None:
+        await glob.db.execute(
+            'UPDATE users '
+            'SET latest_activity = UNIX_TIMESTAMP() '
+            'WHERE id = %s',
+            [self.id]
+        )
+
+    def queue_empty(self) -> bool:
+        """Whether or not `self`'s packet queue is empty."""
+        return self._queue.empty()
+
+    def enqueue(self, b: bytes) -> None:
+        """Add data to be sent to the client."""
+        self._queue.put_nowait(b)
+
+    def dequeue(self) -> Optional[bytes]:
+        """Get data from the queue to send to the client."""
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    async def send(self, client: 'Player', msg: str,
+                   chan: Optional[Channel] = None) -> None:
+        """Enqueue `client`'s `msg` to `self`. Sent in `chan`, or dm."""
+        self.enqueue(
+            packets.sendMessage(
+                client = client.name,
+                msg = msg,
+                target = (chan or self).name,
+                client_id = client.id
+            )
+        )
