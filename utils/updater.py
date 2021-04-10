@@ -5,15 +5,24 @@
 # and when it detects a change, it will apply any nescessary
 # changes to your sql database & keep cmyui_pkg up to date.
 
-from importlib.metadata import version
-from pip._internal.cli.main import main as pip_main
-from typing import Optional
-from cmyui import Version, log, Ansi
-from pathlib import Path
-from datetime import datetime as dt
+import asyncio
 import re
+import os
+import signal
+from datetime import datetime as dt
+from importlib.metadata import version as pkg_version
+from pathlib import Path
+from typing import Optional
+
+import aiomysql
+from cmyui import Ansi
+from cmyui import log
+from cmyui import Version
+from pip._internal.cli.main import main as pip_main
 
 from objects import glob
+
+__all__ = ('Updater',)
 
 SQL_UPDATES_FILE = Path.cwd() / 'ext/updates.sql'
 
@@ -67,21 +76,21 @@ class Updater:
                 return self.version
 
             # return most recent release version
-            return Version.from_str(list(json['releases'])[-1])
+            return Version.from_str(json['info']['version'])
 
     async def _update_cmyui(self) -> None:
         """Check if cmyui_pkg has a newer release; update if available."""
-        module_ver = Version.from_str(version('cmyui'))
+        module_ver = Version.from_str(pkg_version('cmyui'))
         latest_ver = await self._get_latest_cmyui()
 
         if module_ver < latest_ver:
             # package is not up to date; update it.
             log(f'Updating cmyui_pkg (v{module_ver!r} -> '
-                                    f'v{latest_ver!r}).', Ansi.MAGENTA)
+                                    f'v{latest_ver!r}).', Ansi.LMAGENTA)
             pip_main(['install', '-Uq', 'cmyui']) # Update quiet
 
     async def _update_sql(self, prev_version: Version) -> None:
-        """Apply any structural changes to the database since the last startup."""
+        """Apply any structural changes to sql since the last startup."""
         if self.version == prev_version:
             # already up to date.
             return
@@ -89,28 +98,61 @@ class Updater:
         # version changed; there may be sql changes.
         content = SQL_UPDATES_FILE.read_text()
 
-        updates = []
+        queries = []
+        q_lines = []
+
         current_ver = None
 
         for line in content.splitlines():
-            if line.startswith('#') or not current_ver:
+            if not line:
+                continue
+
+            if line.startswith('#'):
                 # may be normal comment or new version
                 if rgx := re.fullmatch(r'^# v(?P<ver>\d+\.\d+\.\d+)$', line):
                     current_ver = Version.from_str(rgx['ver'])
 
                 continue
+            elif not current_ver:
+                continue
 
             # we only need the updates between the
             # previous and new version of the server.
             if prev_version < current_ver <= self.version:
-                updates.append(line)
+                if line.endswith(';'):
+                    if q_lines:
+                        q_lines.append(line)
+                        queries.append(' '.join(q_lines))
+                        q_lines = []
+                    else:
+                        queries.append(line)
+                else:
+                    q_lines.append(line)
 
-        if not updates:
+        if not queries:
             return
 
         log(f'Updating sql (v{prev_version!r} -> '
-                          f'v{self.version!r}).', Ansi.MAGENTA)
+                          f'v{self.version!r}).', Ansi.LMAGENTA)
 
-        await glob.db.execute('\n'.join(updates))
+        sql_lock = asyncio.Lock()
+
+        # TODO: sql transaction? for rollback
+        async with sql_lock:
+            for query in queries:
+                try:
+                    await glob.db.execute(query)
+                except aiomysql.MySQLError:
+                    # if anything goes wrong while writing a query,
+                    # most likely something is very wrong.
+                    log(f'Failed: {query}', Ansi.GRAY)
+                    log(
+                        "SQL failed to update - unless you've been modifying "
+                        "sql and know what caused this, please please contact "
+                        "cmyui#0425.", Ansi.LRED
+                    )
+
+                    input('Press enter to exit')
+                    os.kill(os.getpid(), signal.SIGTERM)
 
     # TODO _update_config?

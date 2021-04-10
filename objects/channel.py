@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 
 from typing import TYPE_CHECKING
+
+import packets
 from constants.privileges import Privileges
 from objects import glob
-import packets
 
 if TYPE_CHECKING:
     from objects.player import Player
@@ -34,8 +35,7 @@ class Channel:
                  read_priv: Privileges = Privileges.Normal,
                  write_priv: Privileges = Privileges.Normal,
                  auto_join: bool = True,
-                 instance: bool = False,
-                 *args, **kwargs) -> None:
+                 instance: bool = False) -> None:
         self._name = name # 'real' name ('#{multi/spec}_{id}')
         self.topic = topic
         self.read_priv = read_priv
@@ -47,9 +47,12 @@ class Channel:
 
     @property
     def name(self) -> str:
-        return ('#spectator' if self._name.startswith('#spec_')
-           else '#multiplayer' if self._name.startswith('#multi_')
-           else self._name)
+        if self._name.startswith('#spec_'):
+            return '#spectator'
+        elif self._name.startswith('#multi_'):
+            return '#multiplayer'
+        else:
+            return self._name
 
     @property
     def basic_info(self) -> tuple[str, str, int]:
@@ -61,30 +64,43 @@ class Channel:
     def __contains__(self, p: 'Player') -> bool:
         return p in self.players
 
-    async def send(self, client: 'Player', msg: str,
-                   to_self: bool = False) -> None:
-        """Enqueue `client`'s `msg` to all connected clients."""
+    def send(self, msg: str, sender: 'Player',
+             to_self: bool = False) -> None:
+        """Enqueue `msg` to all connected clients from `sender`."""
         self.enqueue(
             packets.sendMessage(
-                client = client.name,
+                sender = sender.name,
                 msg = msg,
-                target = self.name,
-                client_id = client.id
+                recipient = self.name,
+                sender_id = sender.id
             ),
-            immune = () if to_self else (client.id,)
+            immune = () if to_self else (sender.id,)
         )
 
-    async def send_selective(self, client: 'Player', msg: str,
-                             targets: list['Player']) -> None:
-        """Enqueue `client`'s `msg` to `targets`."""
-        for p in (t for t in targets if t in self):
-            await p.send(client, msg, chan=self)
+    def send_bot(self, msg: str) -> None:
+        """Enqueue `msg` to all connected clients from bot."""
+        bot = glob.bot
+
+        self.enqueue(
+            packets.sendMessage(
+                sender = bot.name,
+                msg = msg,
+                recipient = self.name,
+                sender_id = bot.id
+            )
+        )
+
+    def send_selective(self, msg: str, sender: 'Player',
+                       recipients: list['Player']) -> None:
+        """Enqueue `sender`'s `msg` to `recipients`."""
+        for p in [t for t in recipients if t in self]:
+            p.send(msg, sender=sender, chan=self)
 
     def append(self, p: 'Player') -> None:
         """Add `p` to the channel's players."""
         self.players.append(p)
 
-    async def remove(self, p: 'Player') -> None:
+    def remove(self, p: 'Player') -> None:
         """Remove `p` from the channel's players."""
         self.players.remove(p)
 

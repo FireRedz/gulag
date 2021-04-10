@@ -1,4 +1,4 @@
-#!/usr/bin/python3.9
+#!/usr/bin/env python3.9
 # -*- coding: utf-8 -*-
 
 # if you're interested in development, my test server is
@@ -8,176 +8,162 @@
 # osu!'s built-in registration.
 # certificate: https://akatsuki.pw/static/ca.crt
 
+import sys
+
+sys._excepthook = sys.excepthook # backup
+def _excepthook(type, value, traceback):
+    if type is KeyboardInterrupt:
+        print('\33[2K\r', end='Aborted startup.')
+        return
+    print('\x1b[0;31mgulag ran into an issue '
+          'before starting up :(\x1b[0m')
+    sys._excepthook(type, value, traceback)
+sys.excepthook = _excepthook
+
+import os
+from pathlib import Path
+
+import aiohttp
+import cmyui
+import datadog
+import orjson # go zoom
+from cmyui import Ansi
+from cmyui import log
+
+import bg_loops
+from constants.privileges import Privileges
+from objects import glob
+from objects.achievement import Achievement
+from objects.collections import PlayerList
+from objects.collections import MatchList
+from objects.collections import ChannelList
+from objects.collections import ClanList
+from objects.collections import MapPoolList
+from objects.player import Player
+from utils.misc import download_achievement_pngs
+from utils.updater import Updater
+
 __all__ = ()
 
-from objects.achievement import Achievement
-from typing import TYPE_CHECKING
-import asyncio
-import aiohttp
-import orjson # go zoom
-import os
-import time
-from pathlib import Path
-import lzma
-import cmyui
-from cmyui import log, Ansi
-from cmyui.osu import ReplayFrame
-
-from objects import glob
-from objects.player import Player
-from objects.channel import Channel
-from objects.match import MapPool
-from objects.clan import Clan
-
-from constants.gamemodes import GameMode
-from constants.privileges import Privileges
-
-from utils.updater import Updater
-from utils.misc import get_average_press_times
-
-if TYPE_CHECKING:
-    from objects.score import Score
-
 # current version of gulag
-glob.version = cmyui.Version(3, 1, 2)
+# NOTE: this is used internally for the updater, it may be
+# worth reading through it's code before playing with it.
+glob.version = cmyui.Version(3, 2, 5)
 
-async def on_start() -> None:
+async def setup_collections() -> None:
+    """Setup & cache many global collections (mostly from sql)."""
+    glob.players = PlayerList() # online players
+    glob.matches = MatchList() # active multiplayer matches
+
+    glob.channels = await ChannelList.prepare() # active channels
+    glob.clans = await ClanList.prepare() # active clans
+    glob.pools = await MapPoolList.prepare() # active mappools
+
+    # create our bot & append it to the global player list.
+    res = await glob.db.fetch('SELECT name FROM users WHERE id = 1')
+
+    glob.bot = Player(
+        id = 1, name = res['name'], priv = Privileges.Normal,
+        login_time = float(0x7fffffff), # never auto-dc
+        bot_client = True
+    )
+    glob.players.append(glob.bot)
+
+    # global achievements (sorted by vn gamemodes)
+    glob.achievements = {0: [], 1: [], 2: [], 3: []}
+    async for row in glob.db.iterall('SELECT * FROM achievements'):
+        # NOTE: achievement conditions are stored as
+        # stringified python expressions in the database
+        # to allow for easy custom achievements.
+        condition = eval(f'lambda score: {row.pop("cond")}')
+        achievement = Achievement(**row, cond=condition)
+
+        # NOTE: achievements are grouped by modes internally.
+        glob.achievements[row['mode']].append(achievement)
+
+    # static api keys
+    glob.api_keys = {
+        row['api_key']: row['id']
+        for row in await glob.db.fetchall(
+            'SELECT id, api_key FROM users '
+            'WHERE api_key IS NOT NULL'
+        )
+    }
+
+async def before_serving() -> None:
+    """Called before the server begins serving connections."""
+    # retrieve a client session to use for http connections.
     glob.http = aiohttp.ClientSession(json_serialize=orjson.dumps)
 
-    # connect to mysql
+    # retrieve a pool of connections to use for mysql interaction.
     glob.db = cmyui.AsyncSQLPool()
     await glob.db.connect(glob.config.mysql)
 
-    # run the sql updater
+    # run the sql & submodule updater (uses http & db).
     updater = Updater(glob.version)
     await updater.run()
     await updater.log_startup()
 
-    # create our bot & append it to the global player list.
-    glob.bot = Player(id=1, name='Aika', priv=Privileges.Normal)
-    glob.bot.last_recv_time = float(0x7fffffff)
+    # cache many global collections/objects from sql,
+    # such as channels, mappools, clans, bot, etc.
+    await setup_collections()
 
-    glob.players.append(glob.bot)
+    new_coros = []
 
-    # TODO: this section is getting a bit gross.. :P
-    # should be moved and probably refactored pretty hard.
+    # create a task for each donor expiring in 30d.
+    new_coros.extend(await bg_loops.donor_expiry())
 
-    # add all channels from db.
-    async for chan_res in glob.db.iterall('SELECT * FROM channels'):
-        chan_res['read_priv'] = Privileges(chan_res.pop('read_priv', 1))
-        chan_res['write_priv'] = Privileges(chan_res.pop('write_priv', 2))
-        glob.channels.append(Channel(**chan_res))
+    # setup a loop to kick inactive ghosted players.
+    new_coros.append(bg_loops.disconnect_ghosts())
 
-    # add all mappools from db.
-    async for pool_res in glob.db.iterall('SELECT * FROM tourney_pools'):
-        # overwrite basic types with some class types
-        creator = await glob.players.get(id=pool_res['created_by'], sql=True)
-        pool_res['created_by'] = creator # replace id with player object
+    # if the surveillance webhook has a value, run
+    # automatic (still very primitive) detections on
+    # replays deemed by the server's configurable values.
+    if glob.config.webhooks['surveillance']:
+        new_coros.append(bg_loops.replay_detections())
 
-        pool = MapPool(**pool_res)
-        await pool.maps_from_sql()
-        glob.pools.append(pool)
+    # reroll the bot's random status every `interval` sec.
+    new_coros.append(bg_loops.reroll_bot_status(interval=300))
 
-    # add all clans from db.
-    async for clan_res in glob.db.iterall('SELECT * FROM clans'):
-        # fetch all members from sql
-        members_res = await glob.db.fetchall(
-            'SELECT id, clan_rank '
-            'FROM users '
-            'WHERE clan_id = %s',
-            clan_res['id']
-        )
+    for coro in new_coros:
+        glob.app.add_pending_task(coro)
 
-        members = set()
+async def after_serving() -> None:
+    """Called after the server stops serving connections."""
+    if hasattr(glob, 'http'):
+        await glob.http.close()
 
-        for p_id, clan_rank in members_res:
-            if clan_rank == 3:
-                clan_res['owner'] = p_id
+    if hasattr(glob, 'db') and glob.db.pool is not None:
+        await glob.db.close()
 
-            members.add(p_id)
-
-        glob.clans.append(Clan(**clan_res, members=members))
-
-    # add all achievements from db.
-    async for ach_res in glob.db.iterall('SELECT * FROM achievements'):
-        ach_res['cond'] = eval(f'lambda score: {ach_res["cond"]}')
-        glob.achievements[ach_res['mode']].append(Achievement(**ach_res))
-
-    # add new donation ranks & enqueue tasks to remove current ones.
-    # TODO: this system can get quite a bit better; rather than just
-    # removing, it should rather update with the new perks (potentially
-    # a different tier, enqueued after their current perks).
-
-    async def rm_donor(userid: int, delay: int):
-        await asyncio.sleep(delay)
-
-        p = await glob.players.get(id=userid, sql=True)
-        await p.remove_privs(Privileges.Donator)
-
-        log(f"{p}'s donation perks have expired.", Ansi.MAGENTA)
-
-    query = ('SELECT id, donor_end FROM users '
-             'WHERE donor_end > UNIX_TIMESTAMP()')
-
-    async for donation in glob.db.iterall(query):
-        # calculate the delta between now & the exp date.
-        delta = donation['donor_end'] - time.time()
-
-        if delta > (60 * 60 * 24 * 30):
-            # ignore donations expiring in over a months time;
-            # the server should restart relatively often anyways.
-            continue
-
-        asyncio.create_task(rm_donor(donation['id'], delta))
-
-PING_TIMEOUT = 300000 // 10
-async def disconnect_inactive() -> None:
-    """Actively disconnect users above the
-       disconnection time threshold on the osu! server."""
-    while True:
-        ctime = time.time()
-
-        for p in glob.players:
-            if ctime - p.last_recv_time > PING_TIMEOUT:
-                await p.logout()
-
-        # run this indefinitely
-        await asyncio.sleep(30)
-
-REPLAYS_PATH = Path.cwd() / '.data/osr'
-async def run_detections() -> None:
-    """Actively run a background thread throughout gulag's
-       lifespan; it will pull replays determined as sketch
-       from a queue indefinitely."""
-    glob.sketchy_queue = asyncio.Queue() # cursed type hint fix
-    queue: asyncio.Queue['Score'] = glob.sketchy_queue
-
-    frames: list[ReplayFrame] = []
-
-    while score := await queue.get():
-        replay_file = REPLAYS_PATH / f'{score.id}.osr'
-        data = lzma.decompress(replay_file.read_bytes())
-
-        # ignore seed & blank line at end
-        for action in data.decode().split(',')[:-2]:
-            if frame := ReplayFrame.from_str(action):
-                frames.append(frame)
-
-        if score.mode.as_vanilla == GameMode.vn_taiko:
-            # calculate their average press times.
-            # NOTE: this does not currently take hit object
-            # type into account, making it completely unviable
-            # for any gamemode with holds. it's still relatively
-            # reliable for taiko though :D.
-            press_times = get_average_press_times(frames)
-
-            # TODO: add some settings to config for 'sketchy'
-            # values (that should report via discord webhook).
-            # this also ofcourse means.. add webhooks already..
-
-        frames.clear()
+    if hasattr(glob, 'datadog') and glob.datadog is not None:
+        glob.datadog.stop() # stop thread
+        glob.datadog.flush() # flush any leftover
 
 if __name__ == '__main__':
+    # attempt to start up gulag.
+    if sys.version_info < (3, 9):
+        sys.exit('The minimum python version for gulag is 3.9')
+
+    # make sure nginx & mysqld are running.
+    if (
+        glob.config.mysql['host'] in ('localhost', '127.0.0.1') and
+        not os.path.exists('/var/run/mysqld/mysqld.pid')
+    ):
+        sys.exit('Please start your mysqld server.')
+
+    if not os.path.exists('/var/run/nginx.pid'):
+        sys.exit('Please start your nginx server.')
+
+    if glob.config.production:
+        if os.geteuid() == 0:
+            log('It is not recommended to run gulag as root, '
+                'especially in production..', Ansi.LYELLOW)
+
+            if glob.config.advanced:
+                log('The risk is even greater with features '
+                    'such as config.advanced enabled.', Ansi.LRED)
+
     # set cwd to /gulag.
     os.chdir(os.path.dirname(os.path.realpath(__file__)))
 
@@ -189,15 +175,57 @@ if __name__ == '__main__':
         subdir = data_path / sub_dir
         subdir.mkdir(exist_ok=True)
 
-    app = cmyui.Server(name=f'gulag v{glob.version}',
-                       gzip=4, verbose=glob.config.debug)
+    achievements_path = data_path / 'assets/medals/client'
+    if not achievements_path.exists():
+        # create directory & download achievement pngs
+        achievements_path.mkdir(parents=True)
+        download_achievement_pngs(achievements_path)
 
-    # add our domains & tasks
+    # make sure oppai-ng is built and ready.
+    glob.oppai_built = (Path.cwd() / 'oppai-ng/oppai').exists()
+
+    if not glob.oppai_built:
+        log('No oppai-ng compiled binary found. PP for all '
+            'std & taiko scores will be set to 0; instructions '
+            'can be found in the README file.', Ansi.LRED)
+
+    # create a server object, which serves as a map of domains.
+    app = glob.app = cmyui.Server(
+        name=f'gulag v{glob.version}',
+        gzip=4, debug=glob.config.debug
+    )
+
+    # add our endpoint's domains to the server;
+    # each may potentially hold many individual endpoints.
     from domains.cho import domain as cho_domain # c[e4-6]?.ppy.sh
     from domains.osu import domain as osu_domain # osu.ppy.sh
     from domains.ava import domain as ava_domain # a.ppy.sh
-    app.add_domains({cho_domain, osu_domain, ava_domain})
-    app.add_tasks({on_start(), disconnect_inactive(),
-                   run_detections()})
+    from domains.map import domain as map_domain # b.ppy.sh
+    app.add_domains({cho_domain, osu_domain,
+                     ava_domain, map_domain})
 
-    app.run(glob.config.server_addr) # blocking call
+    # enqueue tasks to run once the server
+    # begins, and stops serving connections.
+    # these make sure we set everything up
+    # and take it down nice and graceful.
+    app.before_serving = before_serving
+    app.after_serving = after_serving
+
+    # support for https://datadoghq.com
+    if all(glob.config.datadog.values()):
+        datadog.initialize(**glob.config.datadog)
+        glob.datadog = datadog.ThreadStats()
+        glob.datadog.start(flush_in_thread=True,
+                           flush_interval=15)
+
+        # wipe any previous stats from the page.
+        glob.datadog.gauge('gulag.online_players', 0)
+    else:
+        glob.datadog = None
+
+    # start up the server; this starts
+    # an event loop internally, using
+    # uvloop if it's installed.
+    app.run(glob.config.server_addr,
+            handle_signals=True, # SIGHUP, SIGTERM, SIGINT
+            sigusr1_restart=True) # use SIGUSR1 for restarts

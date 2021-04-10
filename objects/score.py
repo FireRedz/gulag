@@ -1,19 +1,25 @@
+# -*- coding: utf-8 -*-
 
-from typing import Optional, TYPE_CHECKING
-from enum import IntEnum, unique
-from datetime import datetime
 from base64 import b64decode
-from py3rijndael import RijndaelCbc, ZeroPadding
-from cmyui import log, Ansi
+from datetime import datetime
+from enum import IntEnum
+from enum import unique
+from typing import Optional
+from typing import TYPE_CHECKING
 
-from constants.mods import Mods
+from cmyui import Ansi
+from cmyui import log
+from py3rijndael import RijndaelCbc
+from py3rijndael import ZeroPadding
+
 from constants.clientflags import ClientFlags
 from constants.gamemodes import GameMode
-
-from objects.beatmap import Beatmap
+from constants.mods import Mods
 from objects import glob
-
+from objects.beatmap import Beatmap
 from utils.recalculator import PPCalculator
+from utils.misc import escape_enum
+from utils.misc import pymysql_encode
 
 if TYPE_CHECKING:
     from objects.player import Player
@@ -25,6 +31,7 @@ __all__ = (
 )
 
 @unique
+@pymysql_encode(escape_enum)
 class Rank(IntEnum):
     XH = 0
     SH = 1
@@ -51,6 +58,7 @@ class Rank(IntEnum):
         }[self.value]
 
 @unique
+@pymysql_encode(escape_enum)
 class SubmissionStatus(IntEnum):
     # TODO: make a system more like bancho's?
     FAILED = 0
@@ -205,7 +213,7 @@ class Score:
             'status, mode, play_time, '
             'time_elapsed, client_flags '
             f'FROM {sql_table} WHERE id = %s',
-            [scoreid], _dict = False
+            [scoreid], _dict=False
         )
 
         if not res:
@@ -215,7 +223,7 @@ class Score:
 
         s.id = res[0]
         s.bmap = await Beatmap.from_md5(res[1])
-        s.player = await glob.players.get(id=res[2], sql=True)
+        s.player = await glob.players.get_ensure(id=res[2])
 
         (s.pp, s.score, s.max_combo, s.mods, s.acc, s.n300,
          s.n100, s.n50, s.nmiss, s.ngeki, s.nkatu, s.grade,
@@ -242,10 +250,10 @@ class Score:
         data_aes = b64decode(data_b64).decode('latin_1')
 
         aes_key = f'osu!-scoreburgr---------{osu_ver}'
-        cbc = RijndaelCbc(aes_key, iv, ZeroPadding(32), 32)
+        aes = RijndaelCbc(aes_key, iv, ZeroPadding(32), 32)
 
         # score data is delimited by colons (:).
-        data = cbc.decrypt(data_aes).decode().split(':')
+        data = aes.decrypt(data_aes).decode().split(':')
 
         if len(data) != 18:
             log('Received an invalid score submission.', Ansi.LRED)
@@ -312,7 +320,7 @@ class Score:
     async def calc_lb_placement(self) -> int:
         table = self.mode.sql_table
 
-        if self.mode <= GameMode.rx_std:
+        if self.mode >= GameMode.rx_std:
             scoring = 'pp'
             score = self.pp
         else:
@@ -320,9 +328,11 @@ class Score:
             score = self.score
 
         res = await glob.db.fetch(
-            'SELECT COUNT(*) AS c FROM {t} '
-            'WHERE map_md5 = %s AND mode = %s '
-            'AND status = 2 AND {s} > %s'.format(t=table, s=scoring),
+            f'SELECT COUNT(*) AS c FROM {table} s '
+            'INNER JOIN users u ON u.id = s.userid '
+            'WHERE s.map_md5 = %s AND s.mode = %s '
+            'AND s.status = 2 AND u.priv & 1 '
+            f'AND s.{scoring} > %s',
             [self.bmap.md5, self.mode.as_vanilla, score]
         )
 
@@ -333,15 +343,33 @@ class Score:
     # whether it's beneficial or not.
     async def calc_diff(self) -> tuple[float, float]:
         """Calculate PP and star rating for our score."""
-        if self.mode.as_vanilla not in (0, 1):
-            # currently only std and taiko are supported,
-            # since we are simply using oppai-ng alone.
-            return (0.0, 0.0)
+        mode_vn = self.mode.as_vanilla
 
-        ppcalc = await PPCalculator.from_id(
-            self.bmap.id, mods=self.mods, combo=self.max_combo,
-            nmiss=self.nmiss, mode=self.mode, acc=self.acc
-        )
+        if mode_vn in (0, 1):
+            if not glob.oppai_built:
+                # oppai-ng not compiled
+                return (0.0, 0.0)
+
+            pp_attrs = {
+                'mods': self.mods,
+                'combo': self.max_combo,
+                'nmiss': self.nmiss,
+                'mode_vn': mode_vn,
+                'acc': self.acc
+            }
+        elif mode_vn == 2:
+            return (0.0, 0.0)
+        elif mode_vn == 3:
+            if self.bmap.mode.as_vanilla != 3:
+                return (0.0, 0.0) # maniera has no convert support
+
+            pp_attrs = {
+                'mods': self.mods,
+                'score': self.score,
+                'mode_vn': mode_vn
+            }
+
+        ppcalc = await PPCalculator.from_id(map_id=self.bmap.id, **pp_attrs)
 
         if not ppcalc:
             return (0.0, 0.0)

@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 
-from enum import IntFlag, unique
+from enum import IntFlag
+from enum import unique
+
+from utils.misc import pymysql_encode
+from utils.misc import escape_enum
 
 __all__ = ('ClientFlags',)
 
 @unique
+@pymysql_encode(escape_enum)
 class ClientFlags(IntFlag):
     # NOTE: many of these flags are quite outdated and/or
     # broken and are even known to false positive quite often.
     # they can be helpful; just take them with a grain of salt.
 
-    # osu! anticheat <= 2016 (unsure of age)
+    """osu! anticheat <= 2016 (unsure of age)"""
     Clean                       = 0 # no flags sent
 
     # flags for timing errors or desync.
@@ -48,7 +53,7 @@ class ClientFlags(IntFlag):
 
     RawKeyboardDiscrepancy      = 1 << 13
 
-    # osu! anticheat 2019
+    """osu! anticheat 2019"""
     # XXX: the aqn flags were fixed within hours of the osu!
     # update, and vanilla hq is not so widely used anymore.
     RunWithLdFlag   = 1 << 14

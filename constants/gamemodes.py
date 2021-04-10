@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 
-from enum import IntEnum, unique
-from constants.mods import Mods
+from enum import IntEnum
+from enum import unique
 
-__all__ = 'GameMode',
+from constants.mods import Mods
+from utils.misc import pymysql_encode
+from utils.misc import escape_enum
+
+__all__ = ('GameMode',)
 
 gm_str = (
     'vn!std',
@@ -32,6 +36,7 @@ gm_sql = (
 )
 
 @unique
+@pymysql_encode(escape_enum)
 class GameMode(IntEnum):
     vn_std   = 0
     vn_taiko = 1
@@ -78,5 +83,7 @@ class GameMode(IntEnum):
         return gm_str[self.value]
 
     def __format__(self, fmt: str) -> str:
-        return gm_sql[self.value] if fmt == 'sql' \
-          else str(self.value)
+        if fmt == 'sql':
+            return gm_sql[self.value]
+        else:
+            return str(self.value)

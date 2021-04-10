@@ -1,120 +1,111 @@
 [![Discord](https://discordapp.com/api/guilds/748687781605408908/widget.png?style=shield)](https://discord.gg/ShEQgUx)
 
-## A dev-friendly osu! server written in modern python
+DISCLAIMER: gulag is still in a beta stage - the server is certainly getting quite
+stable & useable now, but don't let it fool you too much.. there are still large
+portions of the underlying systems that have yet to be implemented completely correctly.
 
-gulag is my take on the abstraction of an osu! server; it's native
-async and relatively low-level design allows for many features not seen
-in other server implementations (especially for python), and it should
-be more than packed enough with performance-driven programming for any
-realistic private server use-case™️.
+gulag is my implementation of an osu! server's backend (bancho protocol, /web endpoints,
+avatars/assets, and a devevloper rest api). it's designed for relatively experienced devs
+looking for an osu! server with more bells and whistles than many other implementations.
 
-I'm mainly writing this as it's by-far the subject I'm currently the most
-educated in.. I started [Akatsuki](https://akatsuki.pw/) (and programming
-alltogether) back in October of 2017, and I've been managing it since..
+note that in it's current stage, gulag is not nescessarily user-friendly..
+dev-friendly is much better wording; please remember that this is not one of my
+current goals with the project. perhaps eventually the focus will shift, but not
+in the foreseeable future. making small prs to try to fix this is also not a great
+idea, i'm not in the business of trying to make people think it's made to be
+user-friendly when it's not really lol. the time may come eventually.
 
-If you're only in it for performance and don't mind using a lower-level
-language, consider checking out [Peace](https://github.com/Pure-Peace/Peace),
-a somewhat similar modern implementation written in Rust.
+please don't feel like you need to contribute. this is mostly a one man project and
+this is the way i like it; gulag is my baby and i can probably tell you about any
+portion of code off the top of my head. bugfixes and small improvements are welcome,
+but i think with the average osu developer age being quite low, there will be lots
+more newer devs than older devs :P (i myself am still quite new in the grand scheme).
+if you're making large scale changes, do it for learning rather than clout, and
+i promise the long-term game will this kind of behaviour nicely :)
 
-The server is already nearly on-par with competing servers and is already likely
-production-capable; however there's not currently an official finished frontend
-for the project. The central db structure's (users, maps, scores) core elements
-are obviously similar on both ripple and gulag's db setup, so it should not be too
-difficult to get this project working with [Hanayo](https://github.com/osuripple/hanayo),
-though I haven't tried myself. There are also some partially comlpete implementations
-of a frontend for gulag, such as [gulag-web](https://github.com/Yo-ru/gulag-web).
+there is currently no official frontend project for gulag, but members of the community
+have made significant headway with [gulag-web](https://github.com/Yo-ru/gulag-web).
+please note that this project is not maintained by me, and that my focus remains on the
+osu! server itself.
 
-If you're just looking for a standalone osu! server, this is likely one of your
-best bets on the current market, though. Hopefully that will become true on a
-much larger scale with some time ;).
-
-## Plans/Ideas
-
-### Beatmap submission system (medium difficulty & effort)
-
-This one is pretty self-explanatory - be able to submit maps to the server
-using osu!'s normal in-game beatmap submission system. For this, I'm pretty
-sure the id is constrained to being an int32 and negative numbers won't work
-(and i'm already using them for buttons anyways), so we'll probably have to
-count down from 2147483647.. or start from 1b or something lol..
-
-### Tournament host commandset (low/medium difficulty & effort) [almost complete]
-
-Basically the idea for this one is a set of commands for event managers to be
-able to set up things like mappools with the server before the matches, so that
-referees have a set of commands to automatically pick maps/mods, keep score,
-and post updates to the chat and stuff. Could also make it so players are
-automatically moved into the right slots for their team and for team names to
-be gotten from the regex of the tourney match name.. Most of this abstraction
-is also independant of the osu! implementation, so I pretty much have free reign
-on how I do things, so this sounds pretty fun.
-
-### Bound chat embeds that run code server-side (medium? difficulty & effort)
-
-This might not make a hell of a lot of sense, but it's actually already mostly
-working.. Basically, I want clickable embeds in the osu! chat that when clicked,
-run some pre-allocated function server-side that's bound to the player (security).
-This is a really abstract idea so it can be expanded to pretty much everything,
-like in-game admin panels and maybe even interactive menus with some higher-order
-abstraction? We'll see lol.. Credits go to rumoi for the original idea on this one,
-as they tried to implement something similar back in [ruri](https://github.com/rumoi/ruri).
-
-## Requirements
-
-- Some know-how with Linux (tested on Ubuntu 18.04), python, and general-programming knowledge.
-- An osu! account (or more specifically, an osu! api key). This is technically optional, but is required for full usage.
-- An SSL Certificate for c(e4-6).ppy.sh (such as [this](https://github.com/osuthailand/ainu-certificate)).
-
-## Setup
-
-Setup should be pretty simple - the commands below should set you right up.
-
-Notes:
-
-- Ubuntu 20.04 is known to have issues with nginx and osu for unknown reasons?
-- I will not be able to help you out with creating a custom certificate of your own.
-- If you have any difficulties setting up gulag, feel free to join the Discord server at the top of the README, we now have a bit of a community!
+Installation Guide
+-------------
+important notes:
+- ubuntu 20.04 & nginx have unknown issues? i recommend using 18.04
+- i will not help with the creation of a fake *.ppy.sh cert for switcher support.
 
 ```sh
-# Install python3.9 (requires ppa).
+# add ppa for py3.9 (required since it's new)
 sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt install python3.9 python3.9-dev python3.9-distutils
 
-# Install pip for 3.9.
+# install requirements (py3.9, mysql, nginx, build tools, certbot)
+sudo apt install python3.9 python3.9-dev python3.9-distutils \
+                 mysql-server nginx build-essential certbot
+
+# install pip for py3.9
 wget https://bootstrap.pypa.io/get-pip.py
 python3.9 get-pip.py && rm get-pip.py
 
-# Install our db, reverse-proxy, and build tools.
-sudo apt install mysql-server nginx build-essential
-
-# Clone gulag from github.
+# clone the repo & init submodules
 git clone https://github.com/cmyui/gulag.git && cd gulag
-
-# Init & update submodules.
 git submodule init && git submodule update
 
-# Build oppai-ng's binary.
-cd oppai-ng && ./build && cd ..
-
-# Install project requirements.
+# install gulag requirements w/ pip
 python3.9 -m pip install -r ext/requirements.txt
 
-# Import the database structure.
-# NOTE: create an empty database before doing this.
-# This will also insert basic osu! channels & the bot.
+# build oppai-ng's binary
+cd oppai-ng && ./build && cd ..
+
+######################################
+# NOTE: before continuing, create an #
+# empty database in mysql for gulag  #
+######################################
+
+# import gulag's mysql structure
 mysql -u your_sql_username -p your_db_name < ext/db.sql
 
-# Add gulag's nginx config to your nginx/sites-enabled.
-# NOTE: default unix socket location is `/tmp/gulag.sock`,
-# and you will have to change the certificate pathes in
-# the nginx config file to your own certificate pathes.
-sudo ln ext/nginx.conf /etc/nginx/sites-enabled/gulag.conf
+# generate an ssl certificate for your domain (change email & domain)
+sudo certbot certonly \
+    --manual \
+    --preferred-challenges=dns \
+    --email your@email.com \
+    --server https://acme-v02.api.letsencrypt.org/directory \
+    --agree-tos \
+    -d *.your.domain
+
+# copy our nginx config to `sites-enabled` & open for editing
+sudo cp ext/nginx.conf /etc/nginx/sites-enabled/gulag.conf
+sudo nano /etc/nginx/sites-enabled/gulag.conf
+
+##########################################
+# NOTE: before continuing, make sure you #
+# have completely configured the file.   #
+##########################################
+
+# reload the reverse proxy's config
 sudo nginx -s reload
 
-# Configure gulag.
+# copy our gulag config to cwd & open for editing
 cp ext/config.sample.py config.py
 nano config.py
 
-# Start the server.
+##########################################
+# NOTE: before continuing, make sure you #
+# have completely configured the file.   #
+##########################################
+
+# start the server
 ./main.py
 ```
+
+Directory Structure
+------
+    .
+    ├── constants  # code representing gamemodes, mods, privileges, and other constants.
+    ├── ext        # external files from gulag's primary operation.
+    ├── objects    # code for representing players, scores, maps, and more.
+    ├── utils      # utility functions used throughout the codebase for general purposes.
+    └── domains    # the route-continaing domains accessible to the public web.
+        ├── cho    # (ce|c4|c5|c6).ppy.sh/* routes (bancho connections)
+        ├── osu    # osu.ppy.sh/* routes (mainly /web/ & /api/)
+        └── ava    # a.ppy.sh/* routes (avatars)

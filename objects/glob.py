@@ -1,37 +1,72 @@
 # -*- coding: utf-8 -*-
 
-from asyncio import Queue
-from typing import TYPE_CHECKING
-from objects.collections import *
+# note that this is not used directly in this
+# module, but it frequently used through the
+# `glob.config.attr` syntax outside of here.
+import config  # NOQA
 
-import config # imported for indirect use
+# this file contains no actualy definitions
+if __import__('typing').TYPE_CHECKING:
+    from asyncio import Queue
+    from typing import Optional
 
-if TYPE_CHECKING:
     from aiohttp.client import ClientSession
-    from cmyui import AsyncSQLPool, Version
+    from cmyui import AsyncSQLPool
+    from cmyui import Server
+    from cmyui import Version
+    from datadog import ThreadStats
+
+    from objects.achievement import Achievement
+    from objects.collections import PlayerList
+    from objects.collections import ChannelList
+    from objects.collections import MatchList
+    from objects.collections import ClanList
+    from objects.collections import MapPoolList
     from objects.player import Player
     from objects.score import Score
+    from packets import BanchoPacket
+    from packets import Packets
 
-__all__ = ('players', 'channels', 'matches',
-           'pools', 'clans', 'achievements',
-           'db', 'http', 'version', 'bot',
-           'cache', 'sketchy_queue')
+__all__ = (
+    # current server state
+    'players', 'channels', 'matches',
+    'pools', 'clans', 'achievements',
+    'version', 'bot', 'api_keys',
+    'bancho_packets', 'db', 'http',
+    'datadog', 'sketchy_queue',
+    'oppai_built', 'cache'
+)
 
-players = PlayerList()
-channels = ChannelList()
-matches = MatchList()
-pools = MapPoolList()
-clans = ClanList()
+# server object
+app: 'Server'
 
-# store achievements per-gamemode
-achievements = {0: [], 1: [],
-                2: [], 3: []}
+# current server state
+players: 'PlayerList'
+channels: 'ChannelList'
+matches: 'MatchList'
+clans: 'ClanList'
+pools: 'MapPoolList'
+achievements: dict[int, list['Achievement']] # per vn gamemode
 
+bot: 'Player'
+version: 'Version'
+
+# currently registered api tokens
+api_keys: dict[str, int] # {api_key: player_id}
+
+# list of registered packets
+bancho_packets: dict['Packets', 'BanchoPacket']
+
+# active connections
 db: 'AsyncSQLPool'
 http: 'ClientSession'
-version: 'Version'
-bot: 'Player'
-sketchy_queue: Queue['Score']
+datadog: 'Optional[ThreadStats]'
+
+# queue of submitted scores deemed 'sketchy'; to be analyzed.
+sketchy_queue: 'Queue[Score]'
+
+# whether or not the oppai-ng binary was located at startup.
+oppai_built: bool
 
 # gulag's main cache.
 # the idea here is simple - keep a copy of things either from sql or
@@ -57,18 +92,3 @@ cache = {
     # so that we do not have to perform this request multiple times.
     'unsubmitted': set() # {md5, ...}
 }
-
-""" disabled (unused) for now
-# when a score is submitted, the osu! client will submit a
-# performance report of the user's pc along with some technical
-# details about the score. the performance report is submitted
-# in a separate request from the score, so the order we receive
-# them is somewhat arbitrary. we'll use this cache to track the
-# scoreids we've already received, so that when we receive a
-# performance report, we can check sql for the latest score
-# (probably will have some cache of it's own in the future) and
-# check if it's id is in the cache; if so, then we haven't
-# recevied our score yet, so we'll give it some time, this
-# way our report always gets submitted.
-'performance_reports': set() # {scoreid, ...}
-"""

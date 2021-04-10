@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
 
-from typing import Optional
-from enum import IntEnum, unique
-from datetime import datetime
-from collections import defaultdict
-from cmyui import log, Ansi
 import time
+from collections import defaultdict
+from datetime import datetime
+from enum import IntEnum
+from enum import unique
 
-from utils.recalculator import PPCalculator
-from objects import glob
+from cmyui import Ansi
+from cmyui import log
+
 from constants.gamemodes import GameMode
 from constants.mods import Mods
+from objects import glob
+from utils.misc import escape_enum
+from utils.misc import pymysql_encode
+from utils.recalculator import PPCalculator
 
-__all__ = 'RankedStatus', 'Beatmap'
+__all__ = ('RankedStatus', 'Beatmap')
+
+BASE_DOMAIN = glob.config.domain
 
 # for some ungodly reason, different values are used to
 # represent different ranked statuses all throughout osu!
@@ -20,6 +26,7 @@ __all__ = 'RankedStatus', 'Beatmap'
 # but we have nothing to do but deal with it B).
 
 @unique
+@pymysql_encode(escape_enum)
 class RankedStatus(IntEnum):
     """Server side osu! beatmap ranked statuses.
        Same as used in osu!'s /web/getscores.php.
@@ -31,6 +38,17 @@ class RankedStatus(IntEnum):
     Approved = 3
     Qualified = 4
     Loved = 5
+
+    def __str__(self) -> str:
+        return {
+            self.NotSubmitted: 'Unsubmitted',
+            self.Pending: 'Unranked',
+            self.UpdateAvailable: 'Outdated',
+            self.Ranked: 'Ranked',
+            self.Approved: 'Approved',
+            self.Qualified: 'Qualified',
+            self.Loved: 'Loved'
+        }[self.value]
 
     @property
     def osu_api(self):
@@ -121,38 +139,40 @@ class Beatmap:
     """
     __slots__ = ('md5', 'id', 'set_id',
                  'artist', 'title', 'version', 'creator',
-                 'status', 'last_update', 'total_length',
-                 'frozen', 'plays', 'passes',
+                 'last_update', 'total_length', 'max_combo',
+                 'status', 'frozen', 'plays', 'passes',
                  'mode', 'bpm', 'cs', 'od', 'ar', 'hp',
                  'diff', 'pp_cache')
 
     def __init__(self, **kwargs):
-        self.md5 = kwargs.pop('md5', '')
-        self.id = kwargs.pop('id', 0)
-        self.set_id = kwargs.pop('set_id', 0)
+        self.md5 = kwargs.get('md5', '')
+        self.id = kwargs.get('id', 0)
+        self.set_id = kwargs.get('set_id', 0)
 
-        self.artist = kwargs.pop('artist', '')
-        self.title = kwargs.pop('title', '')
-        self.version = kwargs.pop('version', '') # diff name
-        self.creator = kwargs.pop('creator', '')
+        self.artist = kwargs.get('artist', '')
+        self.title = kwargs.get('title', '')
+        self.version = kwargs.get('version', '') # diff name
+        self.creator = kwargs.get('creator', '')
 
-        self.last_update = kwargs.pop('last_update', datetime(1970, 1, 1))
-        self.total_length = kwargs.pop('total_length', 0)
-        self.status = RankedStatus(kwargs.pop('status', 0))
-        self.frozen = kwargs.pop('frozen', False) == 1
+        self.last_update = kwargs.get('last_update', datetime(1970, 1, 1))
+        self.total_length = kwargs.get('total_length', 0)
+        self.max_combo = kwargs.get('max_combo', 0)
 
-        self.plays = kwargs.pop('plays', 0)
-        self.passes = kwargs.pop('passes', 0)
+        self.status = RankedStatus(kwargs.get('status', 0))
+        self.frozen = kwargs.get('frozen', False) == 1
 
-        self.mode = GameMode(kwargs.pop('mode', 0))
-        self.bpm = kwargs.pop('bpm', 0.0)
-        self.cs = kwargs.pop('cs', 0.0)
-        self.od = kwargs.pop('od', 0.0)
-        self.ar = kwargs.pop('ar', 0.0)
-        self.hp = kwargs.pop('hp', 0.0)
+        self.plays = kwargs.get('plays', 0)
+        self.passes = kwargs.get('passes', 0)
 
-        self.diff = kwargs.pop('diff', 0.00)
-        self.pp_cache = {} # {mods: (acc: pp, ...), ...}
+        self.mode = GameMode(kwargs.get('mode', 0))
+        self.bpm = kwargs.get('bpm', 0.0)
+        self.cs = kwargs.get('cs', 0.0)
+        self.od = kwargs.get('od', 0.0)
+        self.ar = kwargs.get('ar', 0.0)
+        self.hp = kwargs.get('hp', 0.0)
+
+        self.diff = kwargs.get('diff', 0.00)
+        self.pp_cache = {0: {}, 1: {}, 2: {}, 3: {}} # {mode_vn: {mods: (acc/score: pp, ...), ...}}
 
     @property
     def filename(self) -> str:
@@ -167,20 +187,26 @@ class Beatmap:
     @property
     def url(self):
         """The osu! beatmap url for `self`."""
-        return f'https://osu.ppy.sh/b/{self.id}'
+        return f'https://osu.{BASE_DOMAIN}/b/{self.id}'
 
     @property
     def set_url(self) -> str:
         """The osu! beatmap set url for `self`."""
-        return f'https://osu.ppy.sh/s/{self.set_id}'
+        return f'https://osu.{BASE_DOMAIN}/s/{self.set_id}'
 
     @property
     def embed(self) -> str:
         """An osu! chat embed to `self`'s osu! beatmap page."""
         return f'[{self.url} {self.full}]'
 
+    @property
+    def awards_pp(self) -> bool:
+        """Return whether the map's status awards pp for scores."""
+        return self.status in (RankedStatus.Ranked,
+                               RankedStatus.Approved)
+
     @classmethod
-    async def from_bid(cls, bid: int):
+    async def from_bid(cls, bid: int) -> 'Beatmap':
         """Create a `Beatmap` from sql using a beatmap id."""
         # TODO: perhaps some better caching solution that allows
         # for maps to be retrieved from the cache by id OR md5?
@@ -207,17 +233,18 @@ class Beatmap:
 
     @classmethod
     async def from_bid_sql(cls, bid: int):
-        if not (res := await glob.db.fetch(
-            'SELECT set_id, status, md5, '
+        """Fetch & return a map object from sql by id."""
+        if res := await glob.db.fetch(
+            'SELECT md5, set_id, '
             'artist, title, version, creator, '
-            'last_update, total_length, frozen, '
-            'mode, plays, passes, bpm, cs, od, '
-            'ar, hp, diff '
+            'last_update, total_length, max_combo, '
+            'status, frozen, plays, passes, '
+            'mode, bpm, cs, od, ar, hp, '
+            'diff '
             'FROM maps WHERE id = %s',
             [bid]
-        )): return
-
-        return cls(**res, id=bid)
+        ):
+            return cls(**res, id=bid)
 
     @classmethod
     async def from_md5(cls, md5: str):
@@ -256,6 +283,7 @@ class Beatmap:
 
     @staticmethod
     def from_md5_cache(md5: str):
+        """Fetch & return a map object from cache by md5."""
         if md5 in glob.cache['beatmap']:
             # check if our cached result is within timeout.
             cached = glob.cache['beatmap'][md5]
@@ -269,20 +297,22 @@ class Beatmap:
 
     @classmethod
     async def from_md5_sql(cls, md5: str):
-        if not (res := await glob.db.fetch(
-            'SELECT id, set_id, status, '
+        """Fetch & return a map object from sql by md5."""
+        if res := await glob.db.fetch(
+            'SELECT id, set_id, '
             'artist, title, version, creator, '
-            'last_update, total_length, frozen, '
-            'plays, passes, mode, bpm, cs, od, '
-            'ar, hp, diff '
+            'last_update, total_length, max_combo, '
+            'status, frozen, plays, passes, '
+            'mode, bpm, cs, od, ar, hp, '
+            'diff '
             'FROM maps WHERE md5 = %s',
             [md5]
-        )): return
-
-        return cls(**res, md5=md5)
+        ):
+            return cls(**res, md5=md5)
 
     @classmethod
     async def from_md5_osuapi(cls, md5: str):
+        """Fetch & return a map object from osu!api by md5."""
         url = 'https://old.ppy.sh/api/get_beatmaps'
         params = {'k': glob.config.osu_api_key, 'h': md5}
 
@@ -301,7 +331,7 @@ class Beatmap:
         m.md5 = md5
         m.id = int(bmap['beatmap_id'])
         m.set_id = int(bmap['beatmapset_id'])
-        m.status = RankedStatus.from_osuapi(int(bmap['approved']))
+
         m.artist, m.title, m.version, m.creator = (
             bmap['artist'], bmap['title'],
             bmap['version'], bmap['creator']
@@ -309,6 +339,12 @@ class Beatmap:
 
         m.last_update = datetime.strptime(
             bmap['last_update'], '%Y-%m-%d %H:%M:%S')
+        m.total_length = int(bmap['total_length'])
+
+        if bmap['max_combo'] is not None:
+            m.max_combo = int(bmap['max_combo'])
+
+        m.status = RankedStatus.from_osuapi(int(bmap['approved']))
 
         m.mode = GameMode(int(bmap['mode']))
         m.bpm = float(bmap['bpm'])
@@ -346,7 +382,9 @@ class Beatmap:
             # New map, just save to sql.
             await m.save_to_sql()
 
-        log(f'Retrieved {m.full} from the osu!api.', Ansi.LGREEN)
+        if glob.app.debug:
+            log(f'Retrieved {m.full} from the osu!api.', Ansi.LMAGENTA)
+
         return m
 
     @classmethod
@@ -375,6 +413,9 @@ class Beatmap:
                         for r in res}
 
         for bmap in apidata:
+            if bmap['file_md5'] is None:
+                continue # ded
+
             # convert the map's last_update time to datetime.
             bmap['last_update'] = datetime.strptime(
                 bmap['last_update'], '%Y-%m-%d %H:%M:%S')
@@ -390,8 +431,10 @@ class Beatmap:
                     # api's value before inserting it into the database.
                     api_status = RankedStatus.from_osuapi(int(bmap['approved']))
 
-                    if current_data[map_id]['frozen'] \
-                    and api_status != current_data[map_id]['status']:
+                    if (
+                        current_data[map_id]['frozen'] and
+                        api_status != current_data[map_id]['status']
+                    ):
                         # keep the ranked status of maps through updates,
                         # if we've specified to (by 'freezing' it).
                         bmap['approved'] = current_data[map_id]['status']
@@ -416,14 +459,20 @@ class Beatmap:
             m.md5 = bmap['file_md5']
             m.id = map_id
             m.set_id = set_id
-            m.status = bmap['approved']
-            m.frozen = bmap['frozen']
+
             m.artist, m.title, m.version, m.creator = (
                 bmap['artist'], bmap['title'],
                 bmap['version'], bmap['creator']
             )
 
             m.last_update = bmap['last_update']
+            m.total_length = int(bmap['total_length'])
+
+            if bmap['max_combo'] is not None:
+                m.max_combo = int(bmap['max_combo'])
+
+            m.status = bmap['approved']
+            m.frozen = bmap['frozen']
 
             m.mode = GameMode(int(bmap['mode']))
             m.bpm = float(bmap['bpm'])
@@ -443,44 +492,59 @@ class Beatmap:
 
             await m.save_to_sql()
 
-            log(f'Retrieved {m.full} from the osu!api.', Ansi.LGREEN)
-
+            if glob.app.debug:
+                log(f'Retrieved {m.full} from the osu!api.', Ansi.LMAGENTA)
 
     async def cache_pp(self, mods: Mods) -> None:
         """Cache some common acc pp values for specified mods."""
-        self.pp_cache[mods] = [0.0, 0.0, 0.0, 0.0, 0.0]
+        mode_vn = self.mode.as_vanilla
+        self.pp_cache[mode_vn][mods] = [0.0, 0.0, 0.0, 0.0, 0.0]
 
         ppcalc = await PPCalculator.from_id(
-            self.id, mode=self.mode, mods=mods
+            map_id=self.id, mods=mods,
+            mode_vn=mode_vn
         )
 
-        for idx, acc in enumerate((90, 95, 98, 99, 100)):
-            ppcalc.acc = acc
+        if not ppcalc:
+            return
 
-            pp, _ = await ppcalc.perform() # don't need sr
-            self.pp_cache[mods][idx] = pp
+        if mode_vn in (0, 1): # std/taiko, use acc
+            for idx, acc in enumerate(glob.config.pp_cached_accs):
+                ppcalc.pp_attrs['acc'] = acc
+
+                pp, _ = await ppcalc.perform() # don't need sr
+                self.pp_cache[mode_vn][mods][idx] = pp
+        elif mode_vn == 2:
+            return # unsupported gm
+        elif mode_vn == 3: # mania, use score
+            for idx, score in enumerate(glob.config.pp_cached_scores):
+                ppcalc.pp_attrs['score'] = score
+
+                pp, _ = await ppcalc.perform()
+                self.pp_cache[mode_vn][mods][idx] = pp
 
     async def save_to_sql(self) -> None:
         """Save the the object into sql."""
-        params = [
-            self.md5, self.id, self.set_id, self.status,
-            self.artist, self.title, self.version, self.creator,
-            self.last_update, self.total_length, self.frozen,
-            self.mode, self.bpm, self.cs, self.od, self.ar,
-            self.hp, self.diff
-        ]
-
-        if any(map(lambda x: x is None, params)):
-            log('Tried to save invalid beatmap to SQL!', Ansi.LRED)
-            return
-
-        params[3] = int(params[3]) # status
-        params[11] = int(params[11]) # mode
-
         await glob.db.execute(
-            'REPLACE INTO maps (md5, id, set_id, status, artist, '
-            'title, version, creator, last_update, total_length, '
-            'frozen, mode, bpm, cs, od, ar, hp, diff) '
-            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '
-            '%s, %s, %s, %s, %s, %s, %s, %s, %s)', params
+            'REPLACE INTO maps ('
+                'server, md5, id, set_id, '
+                'artist, title, version, creator, '
+                'last_update, total_length, max_combo, '
+                'status, frozen, plays, passes, '
+                'mode, bpm, cs, od, ar, hp, diff'
+            ') VALUES ('
+                '"osu!", %s, %s, %s, '
+                '%s, %s, %s, %s, '
+                '%s, %s, %s, '
+                '%s, %s, %s, %s, '
+                '%s, %s, %s, %s, '
+                '%s, %s, %s'
+            ')', [
+                self.md5, self.id, self.set_id,
+                self.artist, self.title, self.version, self.creator,
+                self.last_update, self.total_length, self.max_combo,
+                self.status, self.frozen, self.plays, self.passes,
+                self.mode, self.bpm, self.cs, self.od,
+                self.ar, self.hp, self.diff
+            ]
         )

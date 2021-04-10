@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
-from datetime import datetime as dt, timedelta as td
-
-from typing import Optional, Sequence, Union, TYPE_CHECKING
-from dataclasses import dataclass
 from collections import defaultdict
-from enum import IntEnum, unique
+from dataclasses import dataclass
+from datetime import datetime as dt
+from datetime import timedelta as td
+from enum import IntEnum
+from enum import unique
+from typing import Optional
+from typing import Sequence
+from typing import TYPE_CHECKING
+from typing import Union
 
-from constants import regexes
-from constants.mods import Mods
-from constants.gamemodes import GameMode
-
-from objects import glob
-from objects.beatmap import Beatmap
-
-from utils.misc import point_of_interest
+from cmyui import log, Ansi
 
 import packets
+from constants import regexes
+from constants.gamemodes import GameMode
+from constants.mods import Mods
+from objects import glob
+from objects.beatmap import Beatmap
+from utils.misc import escape_enum
+from utils.misc import point_of_interest
+from utils.misc import pymysql_encode
 
 if TYPE_CHECKING:
     from objects.player import Player
@@ -35,7 +40,10 @@ __all__ = (
     'Match'
 )
 
+BASE_DOMAIN = glob.config.domain
+
 @unique
+@pymysql_encode(escape_enum)
 class SlotStatus(IntEnum):
     open       = 1
     locked     = 2
@@ -49,6 +57,7 @@ class SlotStatus(IntEnum):
     has_player = not_ready | ready | no_map | playing | complete
 
 @unique
+@pymysql_encode(escape_enum)
 class MatchTeams(IntEnum):
     neutral = 0
     blue    = 1
@@ -58,12 +67,14 @@ class MatchTeams(IntEnum):
 # implemented by osu! and send between client/server,
 # quite frequently even, but seems useless??
 @unique
+@pymysql_encode(escape_enum)
 class MatchTypes(IntEnum):
     standard  = 0
     powerplay = 1 # literally no idea what this is for
 """
 
 @unique
+@pymysql_encode(escape_enum)
 class MatchWinConditions(IntEnum):
     score    = 0
     accuracy = 1
@@ -71,6 +82,7 @@ class MatchWinConditions(IntEnum):
     scorev2  = 3
 
 @unique
+@pymysql_encode(escape_enum)
 class MatchTeamTypes(IntEnum):
     head_to_head = 0
     tag_coop     = 1
@@ -120,12 +132,26 @@ class MapPool:
                  'FROM tourney_pool_maps '
                  'WHERE pool_id = %s')
 
-        async for row in glob.db.iterall(query, [self.id]):
-            key = (Mods(row['mods']), row['slot'])
-            bmap = await Beatmap.from_bid(row['map_id'])
+        for row in await glob.db.fetchall(query, [self.id]):
+            map_id = row['map_id']
+            bmap = await Beatmap.from_bid(map_id)
 
-            # TODO: should prolly delete the map from pool and
-            # inform eventually webhook to disc if not found?
+            if not bmap:
+                # map not found? remove it from the
+                # pool and log this incident to console.
+                # NOTE: it's intentional that this removes
+                # it from not only this pool, but all pools.
+                # TODO: perhaps discord webhook?
+                log(f'Removing {map_id} from pool {self.name} (not found).', Ansi.LRED)
+
+                await glob.db.execute(
+                    'DELETE FROM tourney_pool_maps '
+                    'WHERE map_id = %s',
+                    [map_id]
+                )
+                continue
+
+            key = (Mods(row['mods']), row['slot'])
             self.maps[key] = bmap
 
 class Slot:
@@ -144,7 +170,7 @@ class Slot:
     def empty(self) -> bool:
         return self.player is None
 
-    def copy(self, s) -> None:
+    def copy_from(self, s) -> None:
         self.player = s.player
         self.status = s.status
         self.team = s.team
@@ -190,7 +216,9 @@ class Match:
 
         # scrimmage stuff
         'is_scrimming', 'match_points', 'bans',
-        'winners', 'winning_pts', 'use_pp_scoring'
+        'winners', 'winning_pts', 'use_pp_scoring',
+
+        'tourney_clients'
     )
 
     def __init__(self) -> None:
@@ -229,6 +257,8 @@ class Match:
         self.winning_pts = 0
         self.use_pp_scoring = False # only for scrims
 
+        self.tourney_clients: set[int] = set() # player ids
+
     @property
     def url(self) -> str:
         """The match's invitation url."""
@@ -237,7 +267,7 @@ class Match:
     @property
     def map_url(self):
         """The osu! beatmap url for `self`'s map."""
-        return f'https://osu.ppy.sh/b/{self.map_id}'
+        return f'https://{BASE_DOMAIN}/b/{self.map_id}'
 
     @property
     def embed(self) -> str:
@@ -264,34 +294,34 @@ class Match:
         return f'<{self.name} ({self.id})>'
 
     def get_slot(self, p: 'Player') -> Optional[Slot]:
-        # get the slot containing a given player.
+        """Return the slot containing a given player."""
         for s in self.slots:
             if p is s.player:
                 return s
 
     def get_slot_id(self, p: 'Player') -> Optional[int]:
-        # get the slot index containing a given player.
+        """Return the slot index containing a given player."""
         for idx, s in enumerate(self.slots):
             if p is s.player:
                 return idx
 
     def get_free(self) -> Optional[Slot]:
-        # get the first free slot index.
+        """Return the first unoccupied slot in multi, if any."""
         for idx, s in enumerate(self.slots):
             if s.status == SlotStatus.open:
                 return idx
 
     def get_host_slot(self) -> Optional[Slot]:
+        """Return the slot containing the host."""
         for s in self.slots:
-            if s.status & SlotStatus.has_player \
-            and s.player is self.host:
+            if (
+                s.status & SlotStatus.has_player and
+                s.player is self.host
+            ):
                 return s
-
-        return
 
     def copy(self, m: 'Match') -> None:
         """Fully copy the data of another match obj."""
-
         self.map_id = m.map_id
         self.map_md5 = m.map_md5
         self.map_name = m.map_name
@@ -351,8 +381,7 @@ class Match:
     def reset_scrim(self) -> None:
         """Reset the current scrim's winning points & bans."""
         self.match_points.clear()
-        self.winners = []
-
+        self.winners.clear()
         self.bans.clear()
 
     async def await_submissions(self, was_playing: list['Player']
@@ -381,8 +410,11 @@ class Match:
                 max_age = dt.now() - td(seconds=bmap.total_length +
                                                 time_waited + 0.5)
 
-                if rc_score and rc_score.bmap.md5 == self.map_md5 \
-                 and rc_score.play_time > max_age:
+                if (
+                    rc_score and
+                    rc_score.bmap.md5 == self.map_md5 and
+                    rc_score.play_time > max_age
+                ):
                     # score found, add to our scores dict if != 0.
                     if score := getattr(rc_score, win_cond):
                         key = s.player if ffa else s.team
@@ -428,7 +460,7 @@ class Match:
         scores, didnt_submit = await self.await_submissions(was_playing)
 
         for p in didnt_submit:
-            await self.chat.send(glob.bot, f"{p} didn't submit a score (timeout: 10s).")
+            self.chat.send_bot(f"{p} didn't submit a score (timeout: 10s).")
 
         if scores:
             ffa = self.team_type in (MatchTeamTypes.head_to_head,
@@ -476,7 +508,7 @@ class Match:
                     # no winner, just announce the match points so far.
                     # for ffa, we'll only announce the top <=3 players.
                     m_points = sorted(self.match_points.items(), key=lambda x: x[1])
-                    m = f"Total Score: {' | '.join(f'{k.name} - {v}' for k, v in m_points)}"
+                    m = f"Total Score: {' | '.join([f'{k.name} - {v}' for k, v in m_points])}"
 
                 msg.append(m)
                 del m
@@ -523,11 +555,13 @@ class Match:
                     msg.append(f'Total Score: {wname} | {wmp} - {lmp} | {lname}')
 
             if didnt_submit:
-                await self.chat.send(glob.bot, "If you'd like to perform a rematch, "
-                                               "please use the `!mp rematch` command.")
+                self.chat.send_bot(
+                    "If you'd like to perform a rematch, "
+                    "please use the `!mp rematch` command."
+                )
 
             for line in msg:
-                await self.chat.send(glob.bot, line)
+                self.chat.send_bot(line)
 
         else:
-            await self.chat.send(glob.bot, 'Scores could not be calculated.')
+            self.chat.send_bot('Scores could not be calculated.')
